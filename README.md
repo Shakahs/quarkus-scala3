@@ -34,23 +34,31 @@ Additionally, passing compiler flags when in Dev Mode is supported through the u
 
 ### Scala.js in Quarkus Dev Mode
 
-Scala.js sources can be placed under `src/main/scalajs`, `src/main/scala/scalajs`,
-or `src/main/java/scalajs`. Sources under `src/main/shared` (and the equivalent
-Java or Scala shared directories) are compiled for both JVM and Scala.js targets.
-Set `QUARKUS_SCALA3_SCALAJS_MODE=whole` to compile all Scala sources for both
-targets.
+By default the extension discovers sources recursively below `src/main` (and
+`src/test` for tests), unless Maven configures a different source root. Scala.js
+sources belong below `src/main/scalajs`, `src/main/scala/scalajs`, or
+`src/main/java/scalajs`. Sources below the corresponding `shared` directories
+are compiled for both JVM and Scala.js targets. Generated sources remain JVM-only.
 
-Quarkus still watches the sources and invokes the stateful Zinc provider. Zinc
-performs the mixed Java/Scala incremental compilation, while linking is delegated
-to the existing `sbt-scalajs` linker used by the vendored Scala Maven plugin.
-Dev-mode and hot-reload builds use `fastLinkJS`; the Maven full-opt/release goal
-uses `fullLinkJS`. Both linker bridges emit ES modules with the
-`SmallModulesFor(List("my.app"))` split style.
-The linker writes `META-INF/resources/scala-js/scala-js.js` and its source map,
-which Quarkus serves as normal web resources. `sbt` must be available on `PATH`,
-or its executable can be selected with `QUARKUS_SCALA3_SCALAJS_SBT`. An optional
-module initializer can be configured as
-`QUARKUS_SCALA3_SCALAJS_INITIALIZER=fully.qualified.Class#method`.
+Quarkus watches the sources and invokes the stateful Zinc provider. Zinc performs
+the mixed Java/Scala incremental compilation, while the extension invokes the
+existing Scala.js linker dependency on Zinc's Scala.js IR. Dev-mode and hot-reload
+builds use fast linking; production builds use full linking. The output is ES
+modules and `SmallModulesFor` is derived from the application Scala.js source
+packages, leaving dependency code on Scala.js defaults.
+
+For Scala dependencies declared through Maven, the Scala.js target derives the
+standard cross-published sibling artifact (`name_3` becomes `name_sjs1_3`)
+directly from the resolved classpath. It does not query Maven metadata during
+development or release linking. A library without that Scala.js variant fails
+at Scala.js compilation or linking with the normal compiler diagnostic.
+
+Mark one top-level Scala.js entry point with `@main`; the extension automatically
+adds its generated `main(String[])` module initializer. The legacy
+`QUARKUS_SCALA3_SCALAJS_INITIALIZER=fully.qualified.Class#method` setting remains
+available for an additional explicit initializer. Every linked JavaScript chunk
+and source map is published below `META-INF/resources/scala-js/`, which Quarkus
+serves as normal web resources.
 
 The extension works alongside `quarkus-web-bundler`: Scala.js output is served
 as a normal Quarkus resource, while web-bundler continues to bundle local

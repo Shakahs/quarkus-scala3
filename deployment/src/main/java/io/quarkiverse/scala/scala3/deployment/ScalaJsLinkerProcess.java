@@ -29,6 +29,7 @@ final class ScalaJsLinkerProcess {
 
     private static final String STANDARD_CONFIG = "org.scalajs.linker.interface.StandardConfig$";
     private static final String ES_MODULE = "org.scalajs.linker.interface.ModuleKind$ESModule$";
+    private static final String FEWEST_MODULES = "org.scalajs.linker.interface.ModuleSplitStyle$FewestModules$";
     private static final String SMALL_MODULES_FOR = "org.scalajs.linker.interface.ModuleSplitStyle$SmallModulesFor$";
     private static final String MODULE_INITIALIZER = "org.scalajs.linker.interface.ModuleInitializer$";
     private static final String OUTPUT_PATTERNS = "org.scalajs.linker.interface.OutputPatterns$";
@@ -50,7 +51,9 @@ final class ScalaJsLinkerProcess {
     private final EnumMap<LinkMode, Object> irFileCaches = new EnumMap<>(LinkMode.class);
     private final EnumMap<LinkMode, Object> irCacheRuns = new EnumMap<>(LinkMode.class);
 
-    synchronized void link(Set<File> classpath, File outputDirectory, String initializer, File sourceMapBase,
+    synchronized void link(Set<File> classpath, File outputDirectory, List<String> applicationPackages,
+            List<String> scalaMainClasses, String initializer,
+            File sourceMapBase,
             LinkMode mode, Logger log) {
         try {
             Files.createDirectories(outputDirectory.toPath());
@@ -74,8 +77,7 @@ final class ScalaJsLinkerProcess {
 
             Object config = invokeStatic(STANDARD_CONFIG, "apply");
             config = invoke(config, "withModuleKind", staticField(ES_MODULE, "MODULE$"));
-            Object modulePackages = List$.MODULE$.from(CollectionConverters.asScala(List.of("my.app")));
-            Object moduleSplit = invoke(staticField(SMALL_MODULES_FOR, "MODULE$"), "apply", modulePackages);
+            Object moduleSplit = moduleSplitStyle(applicationPackages);
             config = invoke(config, "withModuleSplitStyle", moduleSplit);
             config = invoke(config, "withOptimizer", mode.optimizer);
             config = invoke(config, "withBatchMode", mode == LinkMode.FULL);
@@ -87,7 +89,7 @@ final class ScalaJsLinkerProcess {
             Object effectiveConfig = config;
             Object linker = linkers.computeIfAbsent(mode,
                     ignored -> invokeStatic("org.scalajs.linker.StandardImpl", "linker", effectiveConfig));
-            Object initializers = initializers(initializer);
+            Object initializers = initializers(scalaMainClasses, initializer);
             Object output = invokeStatic("org.scalajs.linker.PathOutputDirectory", "apply",
                     outputDirectory.toPath());
             Method linkMethod = linkerMethod(linker.getClass());
@@ -107,19 +109,31 @@ final class ScalaJsLinkerProcess {
         linkers.clear();
     }
 
-    private static Object initializers(String initializer) {
+    static Object moduleSplitStyle(List<String> applicationPackages) {
+        if (applicationPackages.isEmpty()) {
+            return staticField(FEWEST_MODULES, "MODULE$");
+        }
+        Object modulePackages = List$.MODULE$.from(CollectionConverters.asScala(applicationPackages));
+        return invoke(staticField(SMALL_MODULES_FOR, "MODULE$"), "apply", modulePackages);
+    }
+
+    private static Object initializers(List<String> scalaMainClasses, String initializer) {
+        List<Object> initializers = new java.util.ArrayList<>();
+        Object companion = staticField(MODULE_INITIALIZER, "MODULE$");
+        for (String scalaMainClass : scalaMainClasses) {
+            initializers.add(invoke(companion, "mainMethodWithArgs", scalaMainClass, "main"));
+        }
         if (initializer == null || initializer.isBlank()) {
-            return List$.MODULE$.empty();
+            return List$.MODULE$.from(CollectionConverters.asScala(initializers));
         }
         int separator = initializer.lastIndexOf('#');
         if (separator < 1 || separator == initializer.length() - 1) {
             throw new IllegalArgumentException(
                     "Scala.js initializer must use fully.qualified.Class#method syntax: " + initializer);
         }
-        Object companion = staticField(MODULE_INITIALIZER, "MODULE$");
-        Object moduleInitializer = invoke(companion, "mainMethod", initializer.substring(0, separator),
-                initializer.substring(separator + 1));
-        return List$.MODULE$.from(CollectionConverters.asScala(List.of(moduleInitializer)));
+        initializers.add(invoke(companion, "mainMethod", initializer.substring(0, separator),
+                initializer.substring(separator + 1)));
+        return List$.MODULE$.from(CollectionConverters.asScala(initializers));
     }
 
     private static Method linkerMethod(Class<?> linkerClass) {

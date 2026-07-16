@@ -83,12 +83,15 @@ class Scala3Processor {
         Scala3CompilationProvider.compileScalaJsForRelease(sources, sourceSetDirectory, classesDirectory,
                 outputTarget.getOutputDirectory().toFile(), classpath, release);
 
-        Set<File> linkerClasspath = Scala3CompilationProvider.compilerClasspath(classpath);
+        Set<File> linkerClasspath = Scala3CompilationProvider
+                .compilerClasspath(Scala3CompilationProvider.scalaJsMavenClasspath(classpath));
         linkerClasspath.add(outputTarget.getOutputDirectory().toFile());
         linkerClasspath.add(classesDirectory);
         ScalaJsLinkerProcess linker = new ScalaJsLinkerProcess();
         try {
-            linker.link(linkerClasspath, linkOutput, System.getenv("QUARKUS_SCALA3_SCALAJS_INITIALIZER"),
+            linker.link(linkerClasspath, linkOutput, Scala3CompilationProvider.scalaJsApplicationPackages(sources),
+                    Scala3CompilationProvider.scalaJsMainClasses(sources),
+                    System.getenv("QUARKUS_SCALA3_SCALAJS_INITIALIZER"),
                     sourceSetDirectory, ScalaJsLinkerProcess.LinkMode.FULL,
                     LOG);
             publish(linkOutput, outputTarget.getOutputDirectory().toFile(), generatedResources,

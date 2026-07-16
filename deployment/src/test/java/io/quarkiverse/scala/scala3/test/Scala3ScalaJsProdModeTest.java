@@ -28,6 +28,8 @@ public class Scala3ScalaJsProdModeTest {
     static final QuarkusProdModeTest prodModeTest = new QuarkusProdModeTest()
             .addCustomResourceEntry(Path.of("java/scalajs/ScalaJsGreeting.scala"),
                     "scalajs/ScalaJsGreeting.scala")
+            .addCustomResourceEntry(Path.of("scalajs/ScalaJsMain.scala"),
+                    "scalajs/ScalaJsMain.scala")
             .setArchiveProducer(() -> ShrinkWrap.create(JavaArchive.class)
                     .addAsResource(new StringAsset("quarkus.http.port=8084\n"),
                             "application.properties"))
@@ -47,10 +49,17 @@ public class Scala3ScalaJsProdModeTest {
     public void fullLinkOutputExecutesWithNode() {
         Response response = get("/scala-js/scala-js.js");
         assertEquals(200, response.statusCode());
-        assertNodeOutput(response.asString());
+        assertNodeOutput(response.asString(), "scala-js-release-node-ok");
     }
 
-    private static void assertNodeOutput(String javascript) {
+    @Test
+    public void fullLinkAutomaticallyInitializesScalaMain() {
+        Response response = get("/scala-js/scala-js.js");
+        assertEquals(200, response.statusCode());
+        assertNodeOutput(response.asString(), "scala-js-main-initialized");
+    }
+
+    private static void assertNodeOutput(String javascript, String expectedOutput) {
         Path script = null;
         try {
             script = Files.createTempFile("quarkus-scala3-release-", ".mjs");
@@ -63,8 +72,8 @@ public class Scala3ScalaJsProdModeTest {
             String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
             assertTrue(finished, "Node did not finish executing the released Scala.js: " + output);
             assertEquals(0, process.exitValue(), "Node rejected the released Scala.js: " + output);
-            assertTrue(output.contains("scala-js-release-node-ok"),
-                    "Node did not execute the released Scala.js: " + output);
+            assertTrue(output.contains(expectedOutput),
+                    "Node output did not contain the Scala.js entry point marker: " + output);
         } catch (IOException e) {
             throw new AssertionError("Unable to execute the released Scala.js with Node", e);
         } catch (InterruptedException e) {

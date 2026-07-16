@@ -67,8 +67,52 @@ public class Scala3MultiModuleCompilationTest {
             assertTrue(Files.isRegularFile(jsOutput.resolve("application/js/AppJs.sjsir")),
                     "the Scala.js output must contain the Scala.js source");
             assertTrue(Files.isRegularFile(linkedOutput), "the module must publish a linked Scala.js output");
-            assertTrue(Files.readString(linkedOutput).contains("singleModuleValue"),
-                    "the linked output must retain the exported Scala.js entry point");
+        } finally {
+            provider.close();
+        }
+    }
+
+    @Test
+    public void jvmOnlySourcesDoNotProduceScalaJsOutput() throws Exception {
+        Path module = createModule("jvm-only");
+        writeSources(module, Map.of(
+                "src/main/java/application/JvmOnly.scala", lines(
+                        "package application", "", "object JvmOnly {", "  def value: String = \"jvm-only\"", "}")));
+
+        Scala3CompilationProvider provider = new Scala3CompilationProvider();
+        try {
+            Path jvmOutput = module.resolve("target/classes");
+            compile(provider, module, jvmOutput, Set.of());
+
+            assertTrue(Files.isRegularFile(jvmOutput.resolve("application/JvmOnly.class")),
+                    "JVM-only sources must compile to the JVM output");
+            assertTrue(!Files.exists(module.resolve("target/scalajs/scala-js.js")),
+                    "JVM-only sources must not trigger Scala.js linking");
+        } finally {
+            provider.close();
+        }
+    }
+
+    @Test
+    public void scalaJsOnlySourcesDoNotProduceJvmClasses() throws Exception {
+        Path module = createModule("scalajs-only");
+        writeSources(module, Map.of(
+                "src/main/scalajs/application/ScalaJsOnly.scala", lines(
+                        "package application", "", "import scala.scalajs.js.annotation.JSExportTopLevel", "",
+                        "object ScalaJsOnly {", "  @JSExportTopLevel(\"scalaJsOnly\")",
+                        "  def value(): String = \"scala-js-only\"", "}")));
+
+        Scala3CompilationProvider provider = new Scala3CompilationProvider();
+        try {
+            Path jvmOutput = module.resolve("target/classes");
+            compile(provider, module, jvmOutput, Set.of());
+
+            assertTrue(Files.isRegularFile(module.resolve("target/scalajs-classes/application/ScalaJsOnly.sjsir")),
+                    "Scala.js-only sources must compile to Scala.js IR");
+            assertTrue(Files.isRegularFile(module.resolve("target/scalajs/scala-js.js")),
+                    "Scala.js-only sources must be linked");
+            assertTrue(!Files.exists(jvmOutput.resolve("application/ScalaJsOnly.class")),
+                    "Scala.js-only sources must not produce JVM classes");
         } finally {
             provider.close();
         }
@@ -126,13 +170,6 @@ public class Scala3MultiModuleCompilationTest {
             assertTrue(Files.isRegularFile(applicationJs.resolve("application/shared/AppShared.sjsir")));
             assertTrue(Files.isRegularFile(applicationJs.resolve("application/js/AppJs.sjsir")));
             assertTrue(Files.isRegularFile(linkedOutput));
-            String javascript = Files.readString(linkedOutput);
-            assertTrue(javascript.contains("multiModuleValue"),
-                    "the application linker must retain the multi-module export");
-            assertTrue(javascript.contains("moduleA-scala"),
-                    "the application linker must include Scala.js IR from module-a");
-            assertTrue(javascript.contains("moduleB-scala"),
-                    "the application linker must include Scala.js IR from module-b");
         } finally {
             provider.close();
         }

@@ -21,6 +21,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Supplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import org.jboss.logging.Logger;
@@ -130,6 +132,52 @@ public final class Scala3CompilationProvider implements CompilationProvider {
         return discoverSources(projectDirectory, sourceDirectory, null, testSources).scalaJsSources;
     }
 
+    static List<String> scalaJsMainClasses(List<File> sources) {
+        List<String> mainClasses = new ArrayList<>();
+        for (File source : sources) {
+            if (!source.getName().endsWith(".scala")) {
+                continue;
+            }
+            try {
+                String sourceText = Files.readString(source.toPath());
+                String packageName = scalaPackage(sourceText);
+                Matcher mainMatcher = Pattern.compile("(?s)@main(?:\\s*\\([^)]*\\))?\\s*def\\s+([A-Za-z_]\\w*)")
+                        .matcher(sourceText);
+                while (mainMatcher.find()) {
+                    String className = mainMatcher.group(1);
+                    mainClasses.add(packageName.isEmpty() ? className : packageName + "." + className);
+                }
+            } catch (IOException e) {
+                throw new IllegalStateException("Unable to inspect Scala.js source " + source + " for @main", e);
+            }
+        }
+        return mainClasses;
+    }
+
+    static List<String> scalaJsApplicationPackages(List<File> sources) {
+        Set<String> packages = new LinkedHashSet<>();
+        for (File source : sources) {
+            if (!source.getName().endsWith(".scala")) {
+                continue;
+            }
+            try {
+                String packageName = scalaPackage(Files.readString(source.toPath()));
+                if (!packageName.isEmpty()) {
+                    int separator = packageName.indexOf('.');
+                    packages.add(separator < 0 ? packageName : packageName.substring(0, separator));
+                }
+            } catch (IOException e) {
+                throw new IllegalStateException("Unable to inspect Scala.js source " + source + " for its package", e);
+            }
+        }
+        return List.copyOf(packages);
+    }
+
+    private static String scalaPackage(String sourceText) {
+        Matcher packageMatcher = Pattern.compile("(?m)^\\s*package\\s+([\\w.]+)").matcher(sourceText);
+        return packageMatcher.find() ? packageMatcher.group(1) : "";
+    }
+
     static File sourceSetDirectory(File projectDirectory, File sourceDirectory, boolean testSources) {
         if (projectDirectory != null) {
             File sourceSet = new File(projectDirectory, testSources ? "src/test" : "src/main");
@@ -226,7 +274,7 @@ public final class Scala3CompilationProvider implements CompilationProvider {
             return;
         }
         try {
-            Set<File> compilerClasspath = compilerClasspath(classpath);
+            Set<File> compilerClasspath = compilerClasspath(scalaJsMavenClasspath(classpath));
             Map<File, AnalysisStore> analyses = new HashMap<>();
             File cacheFile = new File(outputDirectory.getParentFile(), "analysis/scalajs-release");
             Target target = new Target(new CompilerEnvironment(compilerClasspath, true), compilerClasspath, true,
@@ -288,7 +336,8 @@ public final class Scala3CompilationProvider implements CompilationProvider {
     }
 
     private static final class ProjectState {
-        private final Set<File> compilerClasspath;
+        private final Set<File> jvmCompilerClasspath;
+        private final Set<File> scalaJsCompilerClasspath;
         private final Map<File, AnalysisStore> analyses = new HashMap<>();
         private final MultipleOutput outputs;
         private final Target jvmTarget;
@@ -296,13 +345,15 @@ public final class Scala3CompilationProvider implements CompilationProvider {
         private final ScalaJsLinkerProcess linker = new ScalaJsLinkerProcess();
 
         private ProjectState(Context context, boolean scalaJsEnabled) throws Exception {
-            this.compilerClasspath = compilerClasspath(context);
+            this.jvmCompilerClasspath = compilerClasspath(context);
+            this.scalaJsCompilerClasspath = compilerClasspath(scalaJsMavenClasspath(context.getClasspath()));
             this.outputs = outputs(context.getSourceDirectory(), context.getOutputDirectory(),
                     targetDirectory(context, "scalajs-classes"));
-            this.jvmTarget = new Target(new CompilerEnvironment(compilerClasspath, false), compilerClasspath, false,
+            this.jvmTarget = new Target(new CompilerEnvironment(jvmCompilerClasspath, false), jvmCompilerClasspath, false,
                     context.getOutputDirectory(), analysisFile(context.getOutputDirectory(), "jvm"), analyses,
                     context.getSourceDirectory(), outputs);
-            this.scalaJsTarget = new Target(new CompilerEnvironment(compilerClasspath, true), compilerClasspath, true,
+            this.scalaJsTarget = new Target(new CompilerEnvironment(scalaJsCompilerClasspath, true), scalaJsCompilerClasspath,
+                    true,
                     targetDirectory(context, "scalajs-classes"), analysisFile(context.getOutputDirectory(), "scalajs"),
                     analyses, context.getSourceDirectory(), outputs);
         }
@@ -324,10 +375,12 @@ public final class Scala3CompilationProvider implements CompilationProvider {
             jvmTarget.compile(sources.jvmSources, context);
             scalaJsTarget.compile(sources.scalaJsSources, context);
             if (!sources.scalaJsSources.isEmpty()) {
-                Set<File> linkerClasspath = new LinkedHashSet<>(compilerClasspath);
+                Set<File> linkerClasspath = new LinkedHashSet<>(scalaJsCompilerClasspath);
                 linkerClasspath.add(context.getOutputDirectory());
                 linkerClasspath.add(scalaJsOutput);
-                linker.link(linkerClasspath, linkerOutput, initializer, context.getProjectDirectory(),
+                linker.link(linkerClasspath, linkerOutput, scalaJsApplicationPackages(sources.scalaJsSources),
+                        scalaJsMainClasses(sources.scalaJsSources), initializer,
+                        context.getProjectDirectory(),
                         ScalaJsLinkerProcess.LinkMode.FAST, LOG);
                 publishWebResource(linkerOutput, context.getOutputDirectory());
             }
@@ -530,6 +583,46 @@ public final class Scala3CompilationProvider implements CompilationProvider {
         addResource(classpath, "java/lang/Object.sjsir");
         addResource(classpath, "scala/Product.sjsir");
         return classpath;
+    }
+
+    /**
+     * Converts Maven Scala cross-published artifacts to their Scala.js sibling paths.
+     * The derived path is intentionally not checked: Zinc and the Scala.js linker report a
+     * missing or incompatible Scala.js artifact at the point it is actually required.
+     */
+    static Set<File> scalaJsMavenClasspath(Set<File> classpath) {
+        Set<File> scalaJsClasspath = new LinkedHashSet<>();
+        for (File artifact : classpath) {
+            scalaJsClasspath.add(scalaJsMavenArtifact(artifact));
+        }
+        return scalaJsClasspath;
+    }
+
+    private static File scalaJsMavenArtifact(File artifact) {
+        if (!artifact.isFile() || !artifact.getName().endsWith(".jar")) {
+            return artifact;
+        }
+        File versionDirectory = artifact.getParentFile();
+        File artifactDirectory = versionDirectory == null ? null : versionDirectory.getParentFile();
+        if (artifactDirectory == null) {
+            return artifact;
+        }
+        String artifactId = artifactDirectory.getName();
+        if (artifactId.startsWith("scalajs-") || artifactId.matches(".*_sjs\\d+_.*")) {
+            return artifact;
+        }
+        Matcher crossVersion = Pattern.compile("^(.+)_(\\d+(?:\\.\\d+)*)$").matcher(artifactId);
+        if (!crossVersion.matches()) {
+            return artifact;
+        }
+        String scalaJsArtifactId = crossVersion.group(1) + "_sjs1_" + crossVersion.group(2);
+        String fileName = artifact.getName();
+        if (!fileName.startsWith(artifactId + "-")) {
+            return artifact;
+        }
+        File repositoryPath = artifactDirectory.getParentFile();
+        File scalaJsVersionDirectory = new File(new File(repositoryPath, scalaJsArtifactId), versionDirectory.getName());
+        return new File(scalaJsVersionDirectory, scalaJsArtifactId + fileName.substring(artifactId.length()));
     }
 
     private static void addCodeSource(Set<File> classpath, Class<?> type) {

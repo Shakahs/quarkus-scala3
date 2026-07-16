@@ -1,5 +1,6 @@
 package io.quarkiverse.scala.scala3.deployment;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.File;
@@ -84,6 +85,43 @@ class Scala3CompilationProviderSourceRootsTest {
         assertTrue(Files.isRegularFile(releaseClasses.resolve("META-INF/resources/scala-js").resolve(splitModule))
                 && Files.isRegularFile(devClasses.resolve("META-INF/resources/scala-js").resolve(splitModule)),
                 "Both Scala.js publishing paths must retain module-split output " + splitModule);
+    }
+
+    @Test
+    void derivesModuleSplitPackagesFromScalaJsSources(@TempDir Path project) throws Exception {
+        Path source = project.resolve("src/main/scalajs/application/frontend/Main.scala");
+        Files.createDirectories(source.getParent());
+        Files.writeString(source, "package application.frontend\n\nobject Main\n", StandardCharsets.UTF_8);
+
+        List<String> packages = Scala3CompilationProvider.scalaJsApplicationPackages(List.of(source.toFile()));
+        assertEquals(List.of("application"), packages,
+                "the application package must be inferred from its Scala.js source rather than hard-coded");
+
+        Object splitStyle = ScalaJsLinkerProcess.moduleSplitStyle(packages);
+        assertEquals("List(application)", splitStyle.getClass().getMethod("packages").invoke(splitStyle).toString(),
+                "the linker must apply SmallModulesFor to the inferred application package");
+    }
+
+    @Test
+    void derivesScalaJsCrossPublishedMavenArtifactsWithoutRepositoryLookup(@TempDir Path repository)
+            throws Exception {
+        Path jvmArtifact = repository.resolve("com/example/widget_3/1.0.0/widget_3-1.0.0.jar");
+        Files.createDirectories(jvmArtifact.getParent());
+        Files.writeString(jvmArtifact, "jvm artifact", StandardCharsets.UTF_8);
+        Path javaArtifact = repository.resolve("com/example/java-widget/1.0.0/java-widget-1.0.0.jar");
+        Files.createDirectories(javaArtifact.getParent());
+        Files.writeString(javaArtifact, "java artifact", StandardCharsets.UTF_8);
+
+        Set<File> scalaJsClasspath = Scala3CompilationProvider.scalaJsMavenClasspath(
+                Set.of(jvmArtifact.toFile(), javaArtifact.toFile()));
+
+        assertTrue(scalaJsClasspath.contains(
+                repository.resolve("com/example/widget_sjs1_3/1.0.0/widget_sjs1_3-1.0.0.jar").toFile()),
+                "Scala.js must derive the cross-published artifact path locally, without querying Maven");
+        assertTrue(scalaJsClasspath.contains(javaArtifact.toFile()),
+                "ordinary Java artifacts must remain on the Scala.js classpath");
+        assertTrue(!scalaJsClasspath.contains(jvmArtifact.toFile()),
+                "the JVM Scala artifact must be replaced so a missing Scala.js variant fails compilation clearly");
     }
 
     private static void compile(Scala3CompilationProvider provider, Path project, Path sourceDirectory,
