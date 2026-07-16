@@ -1,173 +1,436 @@
 package io.quarkiverse.scala.scala3.deployment;
 
 import java.io.File;
-import java.lang.reflect.Method;
+import java.io.IOException;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import org.jboss.logging.Logger;
 
-import dotty.tools.dotc.interfaces.AbstractFile;
-import dotty.tools.dotc.interfaces.CompilerCallback;
-import dotty.tools.dotc.interfaces.Diagnostic;
-import dotty.tools.dotc.interfaces.SimpleReporter;
-import dotty.tools.dotc.interfaces.SourceFile;
 import io.quarkus.deployment.dev.CompilationProvider;
-import io.quarkus.paths.PathCollection;
+import sbt.internal.inc.PlainVirtualFile;
+import sbt.internal.inc.ZincUtil;
+import scala.Option;
+import xsbti.PathBasedFile;
+import xsbti.Position;
+import xsbti.Problem;
+import xsbti.Reporter;
+import xsbti.Severity;
+import xsbti.VirtualFile;
+import xsbti.compile.AnalysisContents;
+import xsbti.compile.AnalysisStore;
+import xsbti.compile.ClasspathOptions;
+import xsbti.compile.ClasspathOptionsUtil;
+import xsbti.compile.CompileOptions;
+import xsbti.compile.CompileOrder;
+import xsbti.compile.CompileResult;
+import xsbti.compile.CompilerCache;
+import xsbti.compile.Compilers;
+import xsbti.compile.IncOptions;
+import xsbti.compile.IncrementalCompiler;
+import xsbti.compile.Inputs;
+import xsbti.compile.PerClasspathEntryLookup;
+import xsbti.compile.PreviousResult;
+import xsbti.compile.ScalaInstance;
+import xsbti.compile.Setup;
 
 /**
- * Main.process() documentation for "dotty-interface" overload used here.
- * Architectural Decision Record, see javadoc comment below on why this particular appoach was used
+ * Quarkus's synchronous trigger for a stateful Zinc compiler.
  *
- * Notes:
- * - This requires scala3-compiler in the dependencies and classpath of the consuming application
- * - But it allows Quarkus to remain version-agnostic to Scala 3 compilation
- * - We call the user's Scala 3 library to do the compiling
- *
+ * <p>
+ * Quarkus owns source watching and invokes this provider once for each extension that changed.
+ * Zinc receives the complete current Java/Scala source set, so the separate Java and Scala
+ * notifications are harmless: the first invocation performs the incremental compile and the
+ * second invocation is a no-op according to the persisted analysis.
  */
+public final class Scala3CompilationProvider implements CompilationProvider {
 
-/** Entry point to the compiler that can be conveniently used with Java reflection.
- *
- *  This entry point can easily be used without depending on the `dotty` package,
- *  you only need to depend on `dotty-interfaces` and call this method using
- *  reflection. This allows you to write code that will work against multiple
- *  versions of dotty without recompilation.
- *
- *  The trade-off is that you can only pass a SimpleReporter to this method
- *  and not a normal Reporter which is more powerful.
- *
- *  Usage example: [[https://github.com/lampepfl/dotty/tree/master/compiler/test/dotty/tools/dotc/InterfaceEntryPointTest.scala]]
- *
- *  @param args       Arguments to pass to the compiler.
- *  @param simple     Used to log errors, warnings, and info messages.
- *                    The default reporter is used if this is `null`.
- *  @param callback   Used to execute custom code during the compilation
- *                    process. No callbacks will be executed if this is `null`.
- *  @return
- */
-
-/**
- * This just here so that tooling doesn't try to attach the above Javadoc to
- * this method
- */
-public class Scala3CompilationProvider implements CompilationProvider {
-
-    private final Logger log = Logger.getLogger(Scala3CompilationProvider.class);
-
-    // There's currently no way for this kind of extension to use Config providers
-    // So the best way I can come up with passing compiler args is by accepting an ENV var
+    private static final Logger LOG = Logger.getLogger(Scala3CompilationProvider.class);
+    private static final String SCALA_VERSION = "3.8.4";
+    private static final Set<String> HANDLED_EXTENSIONS = Set.of(".scala", ".java");
     private static final String COMPILER_ARGS_ENV_VAR = "QUARKUS_SCALA3_COMPILER_ARGS";
-    private static final Optional<List<String>> COMPILER_ARGS = getCompilerArgsFromEnv();
 
-    private static Optional<List<String>> getCompilerArgsFromEnv() {
-        String compilerArgsString = System.getenv(COMPILER_ARGS_ENV_VAR);
-        if (compilerArgsString == null || compilerArgsString.equals("")) {
-            return Optional.empty();
-        }
-        List<String> compilerArgs = Arrays.asList(compilerArgsString.split(","));
-        return Optional.of(compilerArgs);
-    }
+    private final Map<String, ZincState> states = new HashMap<>();
 
     @Override
     public Set<String> handledExtensions() {
-        return Collections.singleton(".scala");
+        return HANDLED_EXTENSIONS;
     }
 
     @Override
-    public void compile(Set<File> files, Context context) {
-        List<String> sources = files.stream()
-                .map(File::getAbsolutePath)
-                .collect(Collectors.toList());
+    public synchronized void compile(Set<File> changedFiles, Context context) {
+        if (context == null) {
+            throw new IllegalStateException("Quarkus supplied no compilation context");
+        }
 
-        String outdir = context.getOutputDirectory().getAbsolutePath();
+        List<File> sources = findSources(context);
+        if (sources.isEmpty()) {
+            return;
+        }
 
-        String classpath = context.getClasspath().stream()
-                .map(File::getAbsolutePath)
-                .collect(Collectors.joining(File.pathSeparator));
+        String stateKey = context.getOutputDirectory().getAbsolutePath();
+        ZincState state = states.computeIfAbsent(stateKey, ignored -> createState(context));
+        state.compile(sources, context);
+    }
 
-        List<String> compilerArgs = new ArrayList<>(sources);
-        compilerArgs.add("-d");
-        compilerArgs.add(outdir);
-        compilerArgs.add("-classpath");
-        compilerArgs.add(classpath);
-        COMPILER_ARGS.ifPresent(compilerArgs::addAll);
+    @Override
+    public synchronized void close() throws IOException {
+        states.clear();
+    }
 
-        SimpleReporter reporter = new CustomSimpleReporter();
-        CompilerCallback callback = new CustomCompilerCallback();
-
+    private ZincState createState(Context context) {
         try {
-            // Reflect to get the Dotty compiler on the application's Classpath
-            Class<?> mainClass = Class.forName("dotty.tools.dotc.Main");
-            Method process = mainClass.getMethod("process", String[].class, SimpleReporter.class,
-                    CompilerCallback.class);
-            // Run the compiler by calling dotty.tools.dotc.Main.process
-            process.invoke(null, compilerArgs.toArray(String[]::new), reporter, callback);
+            return new ZincState(context);
         } catch (Exception e) {
-            log.error(e.getMessage());
-            log.error(e.getStackTrace());
+            throw new IllegalStateException("Unable to initialize the Scala 3 Zinc compiler", e);
         }
     }
 
-    @Override
-    public Path getSourcePath(Path classFilePath, PathCollection sourcePaths, String classesPath) {
-        return classFilePath;
-    }
-
-    class CustomSimpleReporter implements SimpleReporter {
-        Integer errorCount = 0;
-        Integer warningCount = 0;
-
-        /**
-         * Report a diagnostic.
-         *
-         * @param diag the diagnostic message to report
-         */
-        @Override
-        public void report(Diagnostic diag) {
-            if (diag.level() == Diagnostic.ERROR) {
-                errorCount += 1;
-                log.error(diag.message());
-            }
-            if (diag.level() == Diagnostic.WARNING) {
-                warningCount += 1;
-                log.warn(diag.message());
+    private static List<File> findSources(Context context) {
+        File sourceDirectory = context.getSourceDirectory();
+        if (context.getProjectDirectory() != null) {
+            String sourceSet = context.getOutputDirectory().getName().equals("test-classes") ? "src/test" : "src/main";
+            File projectSourceSet = new File(context.getProjectDirectory(), sourceSet);
+            if (projectSourceSet.isDirectory()) {
+                sourceDirectory = projectSourceSet;
             }
         }
+        if (sourceDirectory == null || !sourceDirectory.isDirectory()) {
+            return Collections.emptyList();
+        }
+        try (var stream = Files.walk(sourceDirectory.toPath())) {
+            return stream.filter(Files::isRegularFile)
+                    .map(Path::toFile)
+                    .filter(file -> file.getName().endsWith(".scala") || file.getName().endsWith(".java"))
+                    .sorted(Comparator.comparing(File::getAbsolutePath))
+                    .collect(Collectors.toList());
+        } catch (IOException e) {
+            throw new IllegalStateException("Unable to enumerate sources under " + sourceDirectory, e);
+        }
     }
 
-    // This is a no-op implementation right now, the super() calls invoke void methods
-    // But it's useful for future reference I think
-    class CustomCompilerCallback implements CompilerCallback {
+    private static List<String> compilerArgs() {
+        String value = System.getenv(COMPILER_ARGS_ENV_VAR);
+        if (value == null || value.isBlank()) {
+            return Collections.emptyList();
+        }
+        return Arrays.stream(value.split(","))
+                .map(String::trim)
+                .filter(arg -> !arg.isEmpty())
+                .collect(Collectors.toList());
+    }
 
-        /**
-         * Called when a class has been generated.
-         *
-         * @param source The source file corresponding to this class. Example:
-         *        ./src/library/scala/collection/Seq.scala
-         * @param generatedClass The generated classfile for this class. Example:
-         *        ./scala/collection/Seq$.class
-         * @param className The name of this class.
-         */
-        @Override
-        public void onClassGenerated(SourceFile source, AbstractFile generatedClass, String className) {
-            CompilerCallback.super.onClassGenerated(source, generatedClass, className);
+    private static final class ZincState {
+        private final File cacheFile;
+        private final AnalysisStore analysisStore;
+        private final IncrementalCompiler compiler;
+        private final Compilers compilers;
+        private final Setup setup;
+        private final ZincLogger logger;
+        private final sbt.internal.inc.ScalaInstance scalaInstance;
+
+        private ZincState(Context context) throws Exception {
+            File outputDirectory = context.getOutputDirectory();
+            File analysisDirectory = new File(outputDirectory.getParentFile(), "analysis");
+            if (!analysisDirectory.isDirectory() && !analysisDirectory.mkdirs()) {
+                throw new IOException("Unable to create Zinc analysis directory " + analysisDirectory);
+            }
+            this.cacheFile = new File(analysisDirectory,
+                    outputDirectory.getName().equals("test-classes") ? "test-compile" : "compile");
+            this.analysisStore = AnalysisStore.getCachedStore(
+                    sbt.internal.inc.FileAnalysisStore.binary(cacheFile));
+            this.logger = new ZincLogger();
+
+            List<File> scalaJars = scalaJars(context.getClasspath());
+            File compilerJar = requiredJar(scalaJars, "scala3-compiler_3-");
+            File bridgeJar = bridgeJar(context);
+
+            this.scalaInstance = scalaInstance(scalaJars);
+            ClasspathOptions classpathOptions = ClasspathOptionsUtil.auto();
+            sbt.internal.inc.AnalyzingCompiler scalaCompiler = new sbt.internal.inc.AnalyzingCompiler(
+                    this.scalaInstance,
+                    ZincUtil.constantBridgeProvider(this.scalaInstance, bridgeJar),
+                    classpathOptions,
+                    new scala.Function1<scala.collection.immutable.Seq<String>, scala.runtime.BoxedUnit>() {
+                        @Override
+                        public scala.runtime.BoxedUnit apply(scala.collection.immutable.Seq<String> ignored) {
+                            return scala.runtime.BoxedUnit.UNIT;
+                        }
+                    },
+                    Option.empty());
+
+            this.compilers = ZincUtil.compilers(
+                    this.scalaInstance,
+                    ClasspathOptionsUtil.boot(),
+                    Option.apply(Path.of(System.getProperty("java.home"))),
+                    scalaCompiler);
+            this.compiler = ZincUtil.defaultIncrementalCompiler();
+            this.setup = Setup.of(
+                    new Lookup(context.getOutputDirectory(), analysisStore),
+                    false,
+                    cacheFile,
+                    CompilerCache.fresh(),
+                    IncOptions.of(),
+                    new ZincReporter(logger),
+                    Optional.empty(),
+                    new xsbti.T2[0]);
+
+            LOG.debugf("Initialized Zinc for Scala %s using %s and %s", SCALA_VERSION, compilerJar, bridgeJar);
         }
 
-        /**
-         * Called when every class for this file has been generated.
-         *
-         * @param source The source file. Example:
-         *        ./src/library/scala/collection/Seq.scala
-         */
+        private void compile(List<File> sources, Context context) {
+            File outputDirectory = context.getOutputDirectory();
+            if (!outputDirectory.isDirectory() && !outputDirectory.mkdirs()) {
+                throw new IllegalStateException("Unable to create compiler output directory " + outputDirectory);
+            }
+
+            List<File> classpath = new ArrayList<>(context.getClasspath());
+            if (!classpath.contains(outputDirectory)) {
+                classpath.add(outputDirectory);
+            }
+
+            VirtualFile[] classpathFiles = classpath.stream()
+                    .map(file -> new PlainVirtualFile(file.toPath()))
+                    .toArray(VirtualFile[]::new);
+            VirtualFile[] sourceFiles = sources.stream()
+                    .map(file -> new PlainVirtualFile(file.toPath()))
+                    .toArray(VirtualFile[]::new);
+
+            List<String> scalacOptions = new ArrayList<>(compilerArgs());
+            scalacOptions.add("-encoding");
+            scalacOptions.add(context.getSourceEncoding().name());
+            List<String> javacOptions = new ArrayList<>();
+            if (context.getReleaseJavaVersion() != null && !context.getReleaseJavaVersion().isBlank()) {
+                javacOptions.add("--release");
+                javacOptions.add(context.getReleaseJavaVersion());
+            }
+
+            CompileOptions options = CompileOptions.of(
+                    classpathFiles,
+                    sourceFiles,
+                    outputDirectory.toPath(),
+                    scalacOptions.toArray(String[]::new),
+                    javacOptions.toArray(String[]::new),
+                    100,
+                    position -> position,
+                    CompileOrder.Mixed);
+
+            try {
+                Thread thread = Thread.currentThread();
+                ClassLoader previousClassLoader = thread.getContextClassLoader();
+                thread.setContextClassLoader(scalaInstance.loader());
+                try {
+                    CompileResult result = compiler.compile(
+                            Inputs.of(compilers, options, setup, previousResult()),
+                            logger);
+                    analysisStore.set(AnalysisContents.create(result.analysis(), result.setup()));
+                } finally {
+                    thread.setContextClassLoader(previousClassLoader);
+                }
+            } catch (xsbti.CompileFailed e) {
+                throw new IllegalStateException("Scala/Java incremental compilation failed", e);
+            }
+        }
+
+        private PreviousResult previousResult() {
+            return analysisStore.get()
+                    .map(contents -> PreviousResult.of(contents.getAnalysis(), contents.getMiniSetup()))
+                    .orElseGet(() -> PreviousResult.of(Optional.empty(), Optional.empty()));
+        }
+
+        private static List<File> scalaJars(Set<File> classpath) {
+            return classpath.stream()
+                    .filter(File::isFile)
+                    .filter(file -> {
+                        String name = file.getName();
+                        return name.startsWith("scala3-") || name.startsWith("scala-library-" + SCALA_VERSION)
+                                || name.startsWith("scala-asm-") || name.startsWith("tasty-core-");
+                    })
+                    .sorted(Comparator.comparing(File::getAbsolutePath))
+                    .collect(Collectors.toList());
+        }
+
+        private static File requiredJar(Iterable<File> files, String prefix) {
+            return toList(files).stream()
+                    .filter(File::isFile)
+                    .filter(file -> file.getName().startsWith(prefix))
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalStateException("Missing Scala compiler dependency " + prefix));
+        }
+
+        private static List<File> toList(Iterable<File> files) {
+            List<File> result = new ArrayList<>();
+            for (File file : files) {
+                result.add(file);
+            }
+            return result;
+        }
+
+        private static sbt.internal.inc.ScalaInstance scalaInstance(List<File> scalaJars)
+                throws MalformedURLException {
+            URL[] urls = scalaJars.stream().map(file -> {
+                try {
+                    return file.toURI().toURL();
+                } catch (MalformedURLException e) {
+                    throw new IllegalStateException(e);
+                }
+            }).toArray(URL[]::new);
+            ClassLoader libraryLoader = new URLClassLoader(urls, Scala3CompilationProvider.class.getClassLoader());
+            ClassLoader compilerLoader = new URLClassLoader(urls, libraryLoader);
+            Option<String> actualVersion = Option.apply(SCALA_VERSION);
+            return new sbt.internal.inc.ScalaInstance(
+                    SCALA_VERSION,
+                    compilerLoader,
+                    compilerLoader,
+                    libraryLoader,
+                    scalaJars.toArray(File[]::new),
+                    scalaJars.toArray(File[]::new),
+                    scalaJars.toArray(File[]::new),
+                    actualVersion);
+        }
+
+        private static File bridgeJar(Context context) {
+            Optional<File> fromClasspath = context.getClasspath().stream()
+                    .filter(File::isFile)
+                    .filter(file -> file.getName().startsWith("scala3-sbt-bridge-"))
+                    .findFirst();
+            if (fromClasspath.isPresent()) {
+                return fromClasspath.get();
+            }
+            try {
+                URL location = Class.forName("xsbt.CompilerBridge", false,
+                        Scala3CompilationProvider.class.getClassLoader())
+                        .getProtectionDomain().getCodeSource().getLocation();
+                return new File(location.toURI());
+            } catch (Exception e) {
+                throw new IllegalStateException("Missing Scala 3 Zinc compiler bridge", e);
+            }
+        }
+    }
+
+    private static final class Lookup implements PerClasspathEntryLookup {
+        private final File outputDirectory;
+        private final AnalysisStore analysisStore;
+
+        private Lookup(File outputDirectory, AnalysisStore analysisStore) {
+            this.outputDirectory = outputDirectory;
+            this.analysisStore = analysisStore;
+        }
+
         @Override
-        public void onSourceCompiled(SourceFile source) {
-            CompilerCallback.super.onSourceCompiled(source);
+        public Optional<xsbti.compile.CompileAnalysis> analysis(VirtualFile classpathEntry) {
+            if (classpathEntry instanceof PathBasedFile) {
+                PathBasedFile pathBasedFile = (PathBasedFile) classpathEntry;
+                if (pathBasedFile.toPath().toFile().equals(outputDirectory)) {
+                    return analysisStore.get().map(AnalysisContents::getAnalysis);
+                }
+            }
+            return Optional.empty();
+        }
+
+        @Override
+        public xsbti.compile.DefinesClass definesClass(VirtualFile classpathEntry) {
+            return name -> sbt.internal.inc.Locate.definesClass(classpathEntry).apply(name);
+        }
+    }
+
+    private static final class ZincLogger implements xsbti.Logger {
+        @Override
+        public void error(Supplier<String> message) {
+            LOG.error(message.get());
+        }
+
+        @Override
+        public void warn(Supplier<String> message) {
+            LOG.warn(message.get());
+        }
+
+        @Override
+        public void info(Supplier<String> message) {
+            LOG.info(message.get());
+        }
+
+        @Override
+        public void debug(Supplier<String> message) {
+            LOG.debug(message.get());
+        }
+
+        @Override
+        public void trace(Supplier<Throwable> throwable) {
+            LOG.trace(throwable.get());
+        }
+    }
+
+    private static final class ZincReporter implements Reporter {
+        private final ZincLogger logger;
+        private final List<Problem> problems = new ArrayList<>();
+
+        private ZincReporter(ZincLogger logger) {
+            this.logger = logger;
+        }
+
+        @Override
+        public void reset() {
+            problems.clear();
+        }
+
+        @Override
+        public boolean hasErrors() {
+            return problems.stream().anyMatch(problem -> problem.severity() == Severity.Error);
+        }
+
+        @Override
+        public boolean hasWarnings() {
+            return problems.stream().anyMatch(problem -> problem.severity() == Severity.Warn);
+        }
+
+        @Override
+        public void printSummary() {
+            if (hasErrors()) {
+                logger.error(() -> "Zinc reported " + problems.size() + " compilation problem(s)");
+            }
+        }
+
+        @Override
+        public Problem[] problems() {
+            return problems.toArray(Problem[]::new);
+        }
+
+        @Override
+        public void log(Problem problem) {
+            problems.add(problem);
+            final String baseMessage = problem.message();
+            String message = baseMessage;
+            if (problem.position() != null) {
+                message = problem.position().sourcePath().map(path -> path + ": " + baseMessage).orElse(baseMessage);
+            }
+            final String renderedMessage = message;
+            if (problem.severity() == Severity.Error) {
+                logger.error(() -> renderedMessage);
+            } else if (problem.severity() == Severity.Warn) {
+                logger.warn(() -> renderedMessage);
+            } else {
+                logger.info(() -> renderedMessage);
+            }
+        }
+
+        @Override
+        public void comment(Position position, String message) {
+            logger.info(() -> message);
         }
     }
 }

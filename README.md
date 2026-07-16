@@ -21,8 +21,11 @@
 
 This extension provides support for Scala 3 in Quarkus.
 
-It uses the `scala3-interfaces` library to avoid user lock-in to any specific version of the Scala 3 compiler (Dotty).
-Instead, the reflection-based API is used and compilation is done by invoking the compiler version the user has installed from the runtime classpath.
+Dev Mode uses Zinc for incremental compilation of the complete Java and Scala
+source set. Quarkus remains responsible for watching files and triggering the
+synchronous compilation provider; Zinc persists analysis and determines the
+affected sources. The consuming build still supplies the Scala 3 compiler and
+the Scala Maven or Gradle lifecycle integration.
 
 For more information and background context on this, there are notes in the `Scala3CompilationProvider.java` file.
 
