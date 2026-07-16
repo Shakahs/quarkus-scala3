@@ -27,6 +27,9 @@
     <quarkus.version>3.37.3</quarkus.version>
     <scala.version>3.8.4</scala.version>
     <zinc.version>2.0.1</zinc.version>
+    <scalajs.version>1.22.0</scalajs.version>
+    <web-bundler.version>2.3.3</web-bundler.version>
+    <mvnpm.lodash.version>4.17.21</mvnpm.lodash.version>
   </properties>
   <dependencyManagement>
     <dependencies>

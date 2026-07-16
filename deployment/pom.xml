@@ -46,6 +46,20 @@
     </dependency>
 
     <dependency>
+      <groupId>io.quarkiverse.web-bundler</groupId>
+      <artifactId>quarkus-web-bundler</artifactId>
+      <version>${web-bundler.version}</version>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.mvnpm</groupId>
+      <artifactId>lodash</artifactId>
+      <version>${mvnpm.lodash.version}</version>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
       <groupId>org.scala-lang</groupId>
       <artifactId>scala3-library_3</artifactId>
       <version>${scala.version}</version>
@@ -55,6 +69,18 @@
       <groupId>org.scala-lang</groupId>
       <artifactId>scala-library</artifactId>
       <version>${scala.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala3-library_sjs1_3</artifactId>
+      <version>${scala.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.scala-js</groupId>
+      <artifactId>scalajs-library_2.13</artifactId>
+      <version>${scalajs.version}</version>
     </dependency>
 
     <dependency>
@@ -90,7 +116,7 @@
         <executions>
           <execution>
             <id>scala-test-compile</id>
-            <phase>test-compile</phase>
+            <phase>process-test-sources</phase>
             <goals>
               <goal>testCompile</goal>
             </goals>

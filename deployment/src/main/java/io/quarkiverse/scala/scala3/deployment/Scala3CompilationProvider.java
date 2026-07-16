@@ -7,11 +7,13 @@ import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -45,26 +47,20 @@ import xsbti.compile.IncrementalCompiler;
 import xsbti.compile.Inputs;
 import xsbti.compile.PerClasspathEntryLookup;
 import xsbti.compile.PreviousResult;
-import xsbti.compile.ScalaInstance;
 import xsbti.compile.Setup;
 
-/**
- * Quarkus's synchronous trigger for a stateful Zinc compiler.
- *
- * <p>
- * Quarkus owns source watching and invokes this provider once for each extension that changed.
- * Zinc receives the complete current Java/Scala source set, so the separate Java and Scala
- * notifications are harmless: the first invocation performs the incremental compile and the
- * second invocation is a no-op according to the persisted analysis.
- */
+/** Coordinates the JVM and Scala.js Zinc targets for one Quarkus project. */
 public final class Scala3CompilationProvider implements CompilationProvider {
 
     private static final Logger LOG = Logger.getLogger(Scala3CompilationProvider.class);
     private static final String SCALA_VERSION = "3.8.4";
     private static final Set<String> HANDLED_EXTENSIONS = Set.of(".scala", ".java");
     private static final String COMPILER_ARGS_ENV_VAR = "QUARKUS_SCALA3_COMPILER_ARGS";
+    private static final String SCALAJS_ENABLED_ENV_VAR = "QUARKUS_SCALA3_SCALAJS";
+    private static final String SCALAJS_MODE_ENV_VAR = "QUARKUS_SCALA3_SCALAJS_MODE";
+    private static final String SCALAJS_INITIALIZER_ENV_VAR = "QUARKUS_SCALA3_SCALAJS_INITIALIZER";
 
-    private final Map<String, ZincState> states = new HashMap<>();
+    private final Map<String, ProjectState> states = new HashMap<>();
 
     @Override
     public Set<String> handledExtensions() {
@@ -77,13 +73,13 @@ public final class Scala3CompilationProvider implements CompilationProvider {
             throw new IllegalStateException("Quarkus supplied no compilation context");
         }
 
-        List<File> sources = findSources(context);
-        if (sources.isEmpty()) {
+        ProjectSources sources = findSources(context);
+        if (sources.jvmSources.isEmpty() && sources.scalaJsSources.isEmpty()) {
             return;
         }
 
         String stateKey = context.getOutputDirectory().getAbsolutePath();
-        ZincState state = states.computeIfAbsent(stateKey, ignored -> createState(context));
+        ProjectState state = states.computeIfAbsent(stateKey, ignored -> createState(context, sources.scalaJsEnabled));
         state.compile(sources, context);
     }
 
@@ -92,15 +88,16 @@ public final class Scala3CompilationProvider implements CompilationProvider {
         states.clear();
     }
 
-    private ZincState createState(Context context) {
+    private ProjectState createState(Context context, boolean scalaJsEnabled) {
         try {
-            return new ZincState(context);
+            return new ProjectState(context, scalaJsEnabled);
         } catch (Exception e) {
+            LOG.error("Unable to initialize the Scala 3 Zinc compiler", e);
             throw new IllegalStateException("Unable to initialize the Scala 3 Zinc compiler", e);
         }
     }
 
-    private static List<File> findSources(Context context) {
+    private static ProjectSources findSources(Context context) {
         File sourceDirectory = context.getSourceDirectory();
         if (context.getProjectDirectory() != null) {
             String sourceSet = context.getOutputDirectory().getName().equals("test-classes") ? "src/test" : "src/main";
@@ -110,17 +107,46 @@ public final class Scala3CompilationProvider implements CompilationProvider {
             }
         }
         if (sourceDirectory == null || !sourceDirectory.isDirectory()) {
-            return Collections.emptyList();
+            return ProjectSources.empty();
         }
+
         try (var stream = Files.walk(sourceDirectory.toPath())) {
-            return stream.filter(Files::isRegularFile)
+            List<File> allSources = stream.filter(Files::isRegularFile)
                     .map(Path::toFile)
                     .filter(file -> file.getName().endsWith(".scala") || file.getName().endsWith(".java"))
                     .sorted(Comparator.comparing(File::getAbsolutePath))
                     .collect(Collectors.toList());
+
+            Path sourceSet = sourceDirectory.toPath().toAbsolutePath().normalize();
+            List<Path> scalaJsRoots = List.of(
+                    sourceSet.resolve("scalajs"),
+                    sourceSet.resolve("java/scalajs"),
+                    sourceSet.resolve("scala/scalajs"));
+            List<Path> sharedRoots = List.of(
+                    sourceSet.resolve("shared"),
+                    sourceSet.resolve("java/shared"),
+                    sourceSet.resolve("scala/shared"));
+            boolean wholeProject = "whole".equalsIgnoreCase(System.getenv(SCALAJS_MODE_ENV_VAR));
+            boolean explicitlyEnabled = Boolean.parseBoolean(System.getenv(SCALAJS_ENABLED_ENV_VAR));
+
+            List<File> jvmSources = allSources.stream()
+                    .filter(file -> scalaJsRoots.stream().noneMatch(root -> isUnder(file.toPath(), root)))
+                    .collect(Collectors.toList());
+            List<File> scalaJsSources = allSources.stream()
+                    .filter(file -> file.getName().endsWith(".scala"))
+                    .filter(file -> wholeProject
+                            || scalaJsRoots.stream().anyMatch(root -> isUnder(file.toPath(), root))
+                            || sharedRoots.stream().anyMatch(root -> isUnder(file.toPath(), root)))
+                    .collect(Collectors.toList());
+
+            return new ProjectSources(jvmSources, scalaJsSources, explicitlyEnabled || !scalaJsSources.isEmpty());
         } catch (IOException e) {
             throw new IllegalStateException("Unable to enumerate sources under " + sourceDirectory, e);
         }
+    }
+
+    private static boolean isUnder(Path file, Path directory) {
+        return file.toAbsolutePath().normalize().startsWith(directory);
     }
 
     private static List<String> compilerArgs() {
@@ -134,31 +160,102 @@ public final class Scala3CompilationProvider implements CompilationProvider {
                 .collect(Collectors.toList());
     }
 
-    private static final class ZincState {
-        private final File cacheFile;
-        private final AnalysisStore analysisStore;
-        private final IncrementalCompiler compiler;
-        private final Compilers compilers;
-        private final Setup setup;
-        private final ZincLogger logger;
-        private final sbt.internal.inc.ScalaInstance scalaInstance;
+    private static final class ProjectSources {
+        private final List<File> jvmSources;
+        private final List<File> scalaJsSources;
+        private final boolean scalaJsEnabled;
 
-        private ZincState(Context context) throws Exception {
-            File outputDirectory = context.getOutputDirectory();
-            File analysisDirectory = new File(outputDirectory.getParentFile(), "analysis");
-            if (!analysisDirectory.isDirectory() && !analysisDirectory.mkdirs()) {
-                throw new IOException("Unable to create Zinc analysis directory " + analysisDirectory);
+        private ProjectSources(List<File> jvmSources, List<File> scalaJsSources, boolean scalaJsEnabled) {
+            this.jvmSources = jvmSources;
+            this.scalaJsSources = scalaJsSources;
+            this.scalaJsEnabled = scalaJsEnabled;
+        }
+
+        private static ProjectSources empty() {
+            return new ProjectSources(Collections.emptyList(), Collections.emptyList(), false);
+        }
+    }
+
+    private static final class ProjectState {
+        private final Target jvm;
+        private final Target scalaJs;
+        private final Set<File> compilerClasspath;
+        private final ScalaJsLinkerProcess linker = new ScalaJsLinkerProcess();
+
+        private ProjectState(Context context, boolean scalaJsEnabled) throws Exception {
+            this.compilerClasspath = compilerClasspath(context);
+            Map<File, AnalysisStore> analyses = new HashMap<>();
+            this.jvm = new Target(new CompilerEnvironment(compilerClasspath, false), compilerClasspath, context, false,
+                    context.getOutputDirectory(), analysisFile(context.getOutputDirectory(), "compile"), analyses);
+            analyses.put(context.getOutputDirectory(), jvm.analysisStore);
+            if (scalaJsEnabled) {
+                File output = targetDirectory(context, "scalajs-classes");
+                this.scalaJs = new Target(new CompilerEnvironment(compilerClasspath, true), compilerClasspath, context,
+                        true, output, analysisFile(output, "scalajs-compile"), analyses);
+                analyses.put(output, scalaJs.analysisStore);
+            } else {
+                this.scalaJs = null;
             }
-            this.cacheFile = new File(analysisDirectory,
-                    outputDirectory.getName().equals("test-classes") ? "test-compile" : "compile");
-            this.analysisStore = AnalysisStore.getCachedStore(
-                    sbt.internal.inc.FileAnalysisStore.binary(cacheFile));
-            this.logger = new ZincLogger();
+        }
 
-            List<File> scalaJars = scalaJars(context.getClasspath());
+        private void compile(ProjectSources sources, Context context) {
+            jvm.compile(sources.jvmSources, context);
+            if (scalaJs == null || sources.scalaJsSources.isEmpty()) {
+                return;
+            }
+
+            scalaJs.compile(sources.scalaJsSources, context);
+            if (!containsSjsir(scalaJs.outputDirectory)) {
+                return;
+            }
+
+            File linkerOutput = targetDirectory(context,
+                    context.getOutputDirectory().getName().equals("test-classes") ? "scalajs-test" : "scalajs");
+            File bridgeDirectory = targetDirectory(context,
+                    context.getOutputDirectory().getName().equals("test-classes") ? "scala-js-sbt-test" : "scala-js-sbt");
+            String initializer = System.getenv(SCALAJS_INITIALIZER_ENV_VAR);
+            linker.link(scalaJs.outputDirectory, compilerClasspath, bridgeDirectory, linkerOutput, initializer,
+                    context.getProjectDirectory(), LOG);
+            publishWebResource(linkerOutput, context.getOutputDirectory());
+        }
+
+        private static boolean containsSjsir(File directory) {
+            if (!directory.isDirectory()) {
+                return false;
+            }
+            try (var stream = Files.walk(directory.toPath())) {
+                return stream.anyMatch(path -> path.toString().endsWith(".sjsir"));
+            } catch (IOException e) {
+                throw new IllegalStateException("Unable to inspect Scala.js output " + directory, e);
+            }
+        }
+
+        private static void publishWebResource(File linkerOutput, File classesDirectory) {
+            try {
+                File resourceDirectory = new File(classesDirectory, "META-INF/resources/scala-js");
+                Files.createDirectories(resourceDirectory.toPath());
+                for (String name : List.of("scala-js.js", "scala-js.js.map")) {
+                    File source = new File(linkerOutput, name);
+                    if (source.isFile()) {
+                        Files.copy(source.toPath(), new File(resourceDirectory, name).toPath(),
+                                StandardCopyOption.REPLACE_EXISTING);
+                    }
+                }
+            } catch (IOException e) {
+                throw new IllegalStateException("Unable to publish Scala.js web resources", e);
+            }
+        }
+    }
+
+    private static final class CompilerEnvironment {
+        private final sbt.internal.inc.ScalaInstance scalaInstance;
+        private final Compilers compilers;
+        private final IncrementalCompiler compiler;
+
+        private CompilerEnvironment(Set<File> compilerClasspath, boolean scalaJs) throws Exception {
+            List<File> scalaJars = scalaJars(compilerClasspath, scalaJs);
             File compilerJar = requiredJar(scalaJars, "scala3-compiler_3-");
-            File bridgeJar = bridgeJar(context);
-
+            File bridgeJar = bridgeJar(compilerClasspath);
             this.scalaInstance = scalaInstance(scalaJars);
             ClasspathOptions classpathOptions = ClasspathOptionsUtil.auto();
             sbt.internal.inc.AnalyzingCompiler scalaCompiler = new sbt.internal.inc.AnalyzingCompiler(
@@ -172,33 +269,65 @@ public final class Scala3CompilationProvider implements CompilationProvider {
                         }
                     },
                     Option.empty());
-
             this.compilers = ZincUtil.compilers(
                     this.scalaInstance,
                     ClasspathOptionsUtil.boot(),
                     Option.apply(Path.of(System.getProperty("java.home"))),
                     scalaCompiler);
             this.compiler = ZincUtil.defaultIncrementalCompiler();
+            LOG.debugf("Initialized shared Zinc environment for Scala %s using %s and %s", SCALA_VERSION,
+                    compilerJar, bridgeJar);
+        }
+    }
+
+    private static final class Target {
+        private final CompilerEnvironment environment;
+        private final File outputDirectory;
+        private final AnalysisStore analysisStore;
+        private final IncrementalCompiler compiler;
+        private final Compilers compilers;
+        private final Setup setup;
+        private final Set<File> compilerClasspath;
+        private final boolean scalaJs;
+
+        private Target(CompilerEnvironment environment, Set<File> compilerClasspath, Context context, boolean scalaJs,
+                File outputDirectory, File cacheFile, Map<File, AnalysisStore> analyses) throws IOException {
+            this.environment = environment;
+            this.compilerClasspath = compilerClasspath;
+            this.outputDirectory = outputDirectory;
+            this.scalaJs = scalaJs;
+            File analysisDirectory = cacheFile.getParentFile();
+            if (!analysisDirectory.isDirectory() && !analysisDirectory.mkdirs()) {
+                throw new IOException("Unable to create Zinc analysis directory " + analysisDirectory);
+            }
+            this.analysisStore = AnalysisStore.getCachedStore(
+                    sbt.internal.inc.FileAnalysisStore.binary(cacheFile));
+            this.compiler = environment.compiler;
+            this.compilers = environment.compilers;
             this.setup = Setup.of(
-                    new Lookup(context.getOutputDirectory(), analysisStore),
+                    new Lookup(analyses),
                     false,
                     cacheFile,
                     CompilerCache.fresh(),
                     IncOptions.of(),
-                    new ZincReporter(logger),
+                    new ZincReporter(new ZincLogger()),
                     Optional.empty(),
                     new xsbti.T2[0]);
-
-            LOG.debugf("Initialized Zinc for Scala %s using %s and %s", SCALA_VERSION, compilerJar, bridgeJar);
         }
 
         private void compile(List<File> sources, Context context) {
-            File outputDirectory = context.getOutputDirectory();
+            if (sources.isEmpty()) {
+                return;
+            }
             if (!outputDirectory.isDirectory() && !outputDirectory.mkdirs()) {
                 throw new IllegalStateException("Unable to create compiler output directory " + outputDirectory);
             }
 
-            List<File> classpath = new ArrayList<>(context.getClasspath());
+            List<File> classpath = new ArrayList<>(compilerClasspath);
+            classpath.removeIf(file -> isIncompatibleScalaLibrary(file, scalaJs));
+            if (scalaJs && !classpath.contains(context.getOutputDirectory())) {
+                classpath.add(context.getOutputDirectory());
+            }
             if (!classpath.contains(outputDirectory)) {
                 classpath.add(outputDirectory);
             }
@@ -210,7 +339,11 @@ public final class Scala3CompilationProvider implements CompilationProvider {
                     .map(file -> new PlainVirtualFile(file.toPath()))
                     .toArray(VirtualFile[]::new);
 
-            List<String> scalacOptions = new ArrayList<>(compilerArgs());
+            List<String> scalacOptions = new ArrayList<>();
+            if (scalaJs) {
+                scalacOptions.add("-scalajs");
+            }
+            scalacOptions.addAll(compilerArgs());
             scalacOptions.add("-encoding");
             scalacOptions.add(context.getSourceEncoding().name());
             List<String> javacOptions = new ArrayList<>();
@@ -232,17 +365,18 @@ public final class Scala3CompilationProvider implements CompilationProvider {
             try {
                 Thread thread = Thread.currentThread();
                 ClassLoader previousClassLoader = thread.getContextClassLoader();
-                thread.setContextClassLoader(scalaInstance.loader());
+                thread.setContextClassLoader(environment.scalaInstance.loader());
                 try {
                     CompileResult result = compiler.compile(
                             Inputs.of(compilers, options, setup, previousResult()),
-                            logger);
+                            new ZincLogger());
                     analysisStore.set(AnalysisContents.create(result.analysis(), result.setup()));
                 } finally {
                     thread.setContextClassLoader(previousClassLoader);
                 }
             } catch (xsbti.CompileFailed e) {
-                throw new IllegalStateException("Scala/Java incremental compilation failed", e);
+                throw new IllegalStateException(
+                        (scalaJs ? "Scala.js" : "Scala") + "/Java incremental compilation failed", e);
             }
         }
 
@@ -251,92 +385,130 @@ public final class Scala3CompilationProvider implements CompilationProvider {
                     .map(contents -> PreviousResult.of(contents.getAnalysis(), contents.getMiniSetup()))
                     .orElseGet(() -> PreviousResult.of(Optional.empty(), Optional.empty()));
         }
+    }
 
-        private static List<File> scalaJars(Set<File> classpath) {
-            return classpath.stream()
-                    .filter(File::isFile)
-                    .filter(file -> {
-                        String name = file.getName();
-                        return name.startsWith("scala3-") || name.startsWith("scala-library-" + SCALA_VERSION)
-                                || name.startsWith("scala-asm-") || name.startsWith("tasty-core-");
-                    })
-                    .sorted(Comparator.comparing(File::getAbsolutePath))
-                    .collect(Collectors.toList());
+    private static File analysisFile(File outputDirectory, String name) {
+        return new File(new File(outputDirectory.getParentFile(), "analysis"), name);
+    }
+
+    private static File targetDirectory(Context context, String name) {
+        return new File(context.getOutputDirectory().getParentFile(), name);
+    }
+
+    private static Set<File> compilerClasspath(Context context) {
+        Set<File> classpath = new LinkedHashSet<>(context.getClasspath());
+        addCodeSource(classpath, dotty.tools.dotc.Compiler.class);
+        addCodeSource(classpath, dotty.tools.xsbt.CompilerBridge.class);
+        addCodeSource(classpath, sbt.internal.inc.ZincUtil.class);
+        addCodeSource(classpath, scala.Option.class);
+        addCodeSource(classpath, scala.tools.asm.ClassVisitor.class);
+        addCodeSource(classpath, dotty.tools.tasty.TastyReader.class);
+        addCodeSource(classpath, scala.scalajs.LinkingInfo.class);
+        return classpath;
+    }
+
+    private static void addCodeSource(Set<File> classpath, Class<?> type) {
+        try {
+            URL location = type.getProtectionDomain().getCodeSource().getLocation();
+            classpath.add(new File(location.toURI()));
+        } catch (Exception e) {
+            throw new IllegalStateException("Unable to locate dependency for " + type.getName(), e);
         }
+    }
 
-        private static File requiredJar(Iterable<File> files, String prefix) {
-            return toList(files).stream()
-                    .filter(File::isFile)
-                    .filter(file -> file.getName().startsWith(prefix))
-                    .findFirst()
-                    .orElseThrow(() -> new IllegalStateException("Missing Scala compiler dependency " + prefix));
+    private static boolean isIncompatibleScalaLibrary(File file, boolean scalaJs) {
+        String name = file.getName();
+        if (name.startsWith("scala-library-2.")) {
+            return true;
         }
+        if (name.startsWith("scala3-library_sjs1_3-")) {
+            return !scalaJs;
+        }
+        return name.startsWith("scala3-library_3-") && scalaJs;
+    }
 
-        private static List<File> toList(Iterable<File> files) {
-            List<File> result = new ArrayList<>();
-            for (File file : files) {
-                result.add(file);
+    private static List<File> scalaJars(Set<File> classpath, boolean scalaJs) {
+        return classpath.stream()
+                .filter(File::isFile)
+                .filter(file -> {
+                    String name = file.getName();
+                    boolean targetLibrary = scalaJs ? name.startsWith("scala3-library_sjs1_3-")
+                            : name.startsWith("scala3-library_3-");
+                    return name.startsWith("scala3-compiler_3-") || targetLibrary
+                            || name.startsWith("scala-library-" + SCALA_VERSION)
+                            || name.startsWith("scala-asm-") || name.startsWith("tasty-core-");
+                })
+                .sorted(Comparator.comparing(File::getAbsolutePath))
+                .collect(Collectors.toList());
+    }
+
+    private static File requiredJar(Iterable<File> files, String prefix) {
+        List<File> candidates = new ArrayList<>();
+        for (File file : files) {
+            if (file.isFile() && file.getName().startsWith(prefix)) {
+                candidates.add(file);
             }
-            return result;
         }
+        return candidates.stream().findFirst()
+                .orElseThrow(() -> new IllegalStateException("Missing Scala compiler dependency " + prefix));
+    }
 
-        private static sbt.internal.inc.ScalaInstance scalaInstance(List<File> scalaJars)
-                throws MalformedURLException {
-            URL[] urls = scalaJars.stream().map(file -> {
-                try {
-                    return file.toURI().toURL();
-                } catch (MalformedURLException e) {
-                    throw new IllegalStateException(e);
-                }
-            }).toArray(URL[]::new);
-            ClassLoader libraryLoader = new URLClassLoader(urls, Scala3CompilationProvider.class.getClassLoader());
-            ClassLoader compilerLoader = new URLClassLoader(urls, libraryLoader);
-            Option<String> actualVersion = Option.apply(SCALA_VERSION);
-            return new sbt.internal.inc.ScalaInstance(
-                    SCALA_VERSION,
-                    compilerLoader,
-                    compilerLoader,
-                    libraryLoader,
-                    scalaJars.toArray(File[]::new),
-                    scalaJars.toArray(File[]::new),
-                    scalaJars.toArray(File[]::new),
-                    actualVersion);
-        }
-
-        private static File bridgeJar(Context context) {
-            Optional<File> fromClasspath = context.getClasspath().stream()
-                    .filter(File::isFile)
-                    .filter(file -> file.getName().startsWith("scala3-sbt-bridge-"))
-                    .findFirst();
-            if (fromClasspath.isPresent()) {
-                return fromClasspath.get();
-            }
+    private static sbt.internal.inc.ScalaInstance scalaInstance(List<File> scalaJars)
+            throws MalformedURLException {
+        URL[] urls = scalaJars.stream().map(file -> {
             try {
-                URL location = Class.forName("xsbt.CompilerBridge", false,
-                        Scala3CompilationProvider.class.getClassLoader())
-                        .getProtectionDomain().getCodeSource().getLocation();
-                return new File(location.toURI());
-            } catch (Exception e) {
-                throw new IllegalStateException("Missing Scala 3 Zinc compiler bridge", e);
+                return file.toURI().toURL();
+            } catch (MalformedURLException e) {
+                throw new IllegalStateException(e);
             }
+        }).toArray(URL[]::new);
+        ClassLoader libraryLoader = new URLClassLoader(urls, Scala3CompilationProvider.class.getClassLoader());
+        ClassLoader compilerLoader = new URLClassLoader(urls, libraryLoader);
+        Option<String> actualVersion = Option.apply(SCALA_VERSION);
+        return new sbt.internal.inc.ScalaInstance(
+                SCALA_VERSION,
+                compilerLoader,
+                compilerLoader,
+                libraryLoader,
+                scalaJars.toArray(File[]::new),
+                scalaJars.toArray(File[]::new),
+                scalaJars.toArray(File[]::new),
+                actualVersion);
+    }
+
+    private static File bridgeJar(Set<File> compilerClasspath) {
+        Optional<File> fromClasspath = compilerClasspath.stream()
+                .filter(File::isFile)
+                .filter(file -> file.getName().startsWith("scala3-sbt-bridge-"))
+                .findFirst();
+        if (fromClasspath.isPresent()) {
+            return fromClasspath.get();
+        }
+        try {
+            URL location = Class.forName("xsbt.CompilerBridge", false,
+                    Scala3CompilationProvider.class.getClassLoader())
+                    .getProtectionDomain().getCodeSource().getLocation();
+            return new File(location.toURI());
+        } catch (Exception e) {
+            throw new IllegalStateException("Missing Scala 3 Zinc compiler bridge", e);
         }
     }
 
     private static final class Lookup implements PerClasspathEntryLookup {
-        private final File outputDirectory;
-        private final AnalysisStore analysisStore;
+        private final Map<File, AnalysisStore> analyses;
 
-        private Lookup(File outputDirectory, AnalysisStore analysisStore) {
-            this.outputDirectory = outputDirectory;
-            this.analysisStore = analysisStore;
+        private Lookup(Map<File, AnalysisStore> analyses) {
+            this.analyses = analyses;
         }
 
         @Override
         public Optional<xsbti.compile.CompileAnalysis> analysis(VirtualFile classpathEntry) {
             if (classpathEntry instanceof PathBasedFile) {
-                PathBasedFile pathBasedFile = (PathBasedFile) classpathEntry;
-                if (pathBasedFile.toPath().toFile().equals(outputDirectory)) {
-                    return analysisStore.get().map(AnalysisContents::getAnalysis);
+                File file = ((PathBasedFile) classpathEntry).toPath().toFile();
+                for (Map.Entry<File, AnalysisStore> entry : analyses.entrySet()) {
+                    if (entry.getKey().equals(file)) {
+                        return entry.getValue().get().map(AnalysisContents::getAnalysis);
+                    }
                 }
             }
             return Optional.empty();
@@ -413,12 +585,13 @@ public final class Scala3CompilationProvider implements CompilationProvider {
         @Override
         public void log(Problem problem) {
             problems.add(problem);
-            final String baseMessage = problem.message();
-            String message = baseMessage;
+            String message = problem.message();
             if (problem.position() != null) {
-                message = problem.position().sourcePath().map(path -> path + ": " + baseMessage).orElse(baseMessage);
+                String originalMessage = message;
+                message = problem.position().sourcePath().map(path -> path + ": " + originalMessage)
+                        .orElse(originalMessage);
             }
-            final String renderedMessage = message;
+            String renderedMessage = message;
             if (problem.severity() == Severity.Error) {
                 logger.error(() -> renderedMessage);
             } else if (problem.severity() == Severity.Warn) {

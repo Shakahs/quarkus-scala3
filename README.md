@@ -11,6 +11,7 @@
     - [Gradle](#gradle)
     - [Maven](#maven)
   - [Passing Scala compiler args in Quarkus Dev Mode](#passing-scala-compiler-args-in-quarkus-dev-mode)
+  - [Scala.js in Quarkus Dev Mode](#scalajs-in-quarkus-dev-mode)
   - [Useful tips and tricks for building Quarkus apps with Scala, common patterns](#useful-tips-and-tricks-for-building-quarkus-apps-with-scala-common-patterns)
     - ["No tests were found"?! How can that be?](#no-tests-were-found-how-can-that-be)
     - [Configuring Scala Jackson and the addon-on "Enum" module for JSON support](#configuring-scala-jackson-and-the-addon-on-enum-module-for-json-support)
@@ -30,6 +31,30 @@ the Scala Maven or Gradle lifecycle integration.
 For more information and background context on this, there are notes in the `Scala3CompilationProvider.java` file.
 
 Additionally, passing compiler flags when in Dev Mode is supported through the use of an environment variable (`QUARKUS_SCALA3_COMPILER_ARGS`) which allows you to mirror your existing Maven/Gradle compilation configuration.
+
+### Scala.js in Quarkus Dev Mode
+
+Scala.js sources can be placed under `src/main/scalajs`, `src/main/scala/scalajs`,
+or `src/main/java/scalajs`. Sources under `src/main/shared` (and the equivalent
+Java or Scala shared directories) are compiled for both JVM and Scala.js targets.
+Set `QUARKUS_SCALA3_SCALAJS_MODE=whole` to compile all Scala sources for both
+targets.
+
+Quarkus still watches the sources and invokes the stateful Zinc provider. Zinc
+performs the mixed Java/Scala incremental compilation, while linking is delegated
+to the existing `sbt-scalajs` linker used by the vendored Scala Maven plugin.
+Dev-mode and hot-reload builds use `fastLinkJS`; the Maven full-opt/release goal
+uses `fullLinkJS`. Both linker bridges emit ES modules with the
+`SmallModulesFor(List("my.app"))` split style.
+The linker writes `META-INF/resources/scala-js/scala-js.js` and its source map,
+which Quarkus serves as normal web resources. `sbt` must be available on `PATH`,
+or its executable can be selected with `QUARKUS_SCALA3_SCALAJS_SBT`. An optional
+module initializer can be configured as
+`QUARKUS_SCALA3_SCALAJS_INITIALIZER=fully.qualified.Class#method`.
+
+The extension works alongside `quarkus-web-bundler`: Scala.js output is served
+as a normal Quarkus resource, while web-bundler continues to bundle local
+JavaScript/TypeScript and Maven-resolved npm dependencies from `src/main/resources/web`.
 
 
 ## Installation
