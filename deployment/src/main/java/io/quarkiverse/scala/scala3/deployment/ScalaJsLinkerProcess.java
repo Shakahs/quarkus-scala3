@@ -1,124 +1,279 @@
 package io.quarkiverse.scala.scala3.deployment;
 
 import java.io.File;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.lang.reflect.Proxy;
 import java.nio.file.Files;
-import java.util.ArrayList;
+import java.nio.file.Path;
+import java.util.EnumMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import org.jboss.logging.Logger;
 
-/**
- * Delegates Scala.js linking to the existing sbt-scalajs linker, following the
- * same bridge-project mechanism used by the vendored scala-maven-plugin.
- */
+import scala.Tuple2;
+import scala.collection.Seq;
+import scala.collection.immutable.List$;
+import scala.concurrent.Await;
+import scala.concurrent.Awaitable;
+import scala.concurrent.ExecutionContext;
+import scala.concurrent.duration.Duration$;
+import scala.jdk.javaapi.CollectionConverters;
+
+/** Invokes the existing Scala.js linker directly, keeping its linker instances stateful. */
 final class ScalaJsLinkerProcess {
 
-    private static final String SBT_EXECUTABLE_ENV_VAR = "QUARKUS_SCALA3_SCALAJS_SBT";
-    private static final String SBT_VERSION = "2.0.2";
-    private static final String SCALA_JS_VERSION = "1.22.0";
+    private static final String STANDARD_CONFIG = "org.scalajs.linker.interface.StandardConfig$";
+    private static final String ES_MODULE = "org.scalajs.linker.interface.ModuleKind$ESModule$";
+    private static final String SMALL_MODULES_FOR = "org.scalajs.linker.interface.ModuleSplitStyle$SmallModulesFor$";
+    private static final String MODULE_INITIALIZER = "org.scalajs.linker.interface.ModuleInitializer$";
+    private static final String OUTPUT_PATTERNS = "org.scalajs.linker.interface.OutputPatterns$";
+    private static final String LINKER = "org.scalajs.linker.interface.Linker";
+    private static final String LOGGER = "org.scalajs.logging.Logger";
 
-    void link(File classesDirectory, Set<File> classpath, File bridgeDirectory, File outputDirectory,
-            String initializer, File sourceMapBase, Logger log) {
+    enum LinkMode {
+        FAST(false),
+        FULL(true);
+
+        private final boolean optimizer;
+
+        LinkMode(boolean optimizer) {
+            this.optimizer = optimizer;
+        }
+    }
+
+    private final EnumMap<LinkMode, Object> linkers = new EnumMap<>(LinkMode.class);
+    private final EnumMap<LinkMode, Object> irFileCaches = new EnumMap<>(LinkMode.class);
+    private final EnumMap<LinkMode, Object> irCacheRuns = new EnumMap<>(LinkMode.class);
+
+    synchronized void link(Set<File> classpath, File outputDirectory, String initializer, File sourceMapBase,
+            LinkMode mode, Logger log) {
         try {
-            Files.createDirectories(bridgeDirectory.toPath());
             Files.createDirectories(outputDirectory.toPath());
-            List<File> linkerClasspath = new ArrayList<>(classpath);
-            addIfMissing(linkerClasspath, classesDirectory);
-            writeBridge(bridgeDirectory, linkerClasspath, outputDirectory, initializer, sourceMapBase);
+            ExecutionContext executionContext = ExecutionContext.global();
+            List<Path> entries = classpath.stream()
+                    .filter(file -> file.isDirectory() || file.getName().endsWith(".jar"))
+                    .map(File::toPath)
+                    .distinct()
+                    .collect(Collectors.toList());
+            Seq<Path> scalaEntries = CollectionConverters.asScala(entries).toSeq();
+            Object discovered = invokeStatic("org.scalajs.linker.PathIRContainer", "fromClasspath", scalaEntries,
+                    executionContext);
+            Tuple2<?, ?> classpathResult = await(discovered);
 
-            String executable = System.getenv().getOrDefault(SBT_EXECUTABLE_ENV_VAR, "sbt");
-            List<String> command = List.of(
-                    executable,
-                    "--sbt-boot", new File(bridgeDirectory, ".sbt-boot").getAbsolutePath(),
-                    "--sbt-dir", new File(bridgeDirectory, ".sbt").getAbsolutePath(),
-                    "--sbt-cache", new File(bridgeDirectory, ".sbt-cache").getAbsolutePath(),
-                    "--ivy", new File(bridgeDirectory, ".ivy2").getAbsolutePath(),
-                    "--batch",
-                    "--server",
-                    "fastLinkJS");
+            Object irFileCache = irFileCaches.computeIfAbsent(mode,
+                    ignored -> invokeStatic("org.scalajs.linker.StandardImpl", "irFileCache"));
+            Object irCacheRun = irCacheRuns.computeIfAbsent(mode,
+                    ignored -> invoke(irFileCache, "newCache"));
+            Object cachedIRFiles = invoke(irCacheRun, "cached", classpathResult._1(), executionContext);
+            Seq<?> scalaIrFiles = await(cachedIRFiles);
 
-            log.infof("Linking Scala.js with sbt-scalajs into %s", outputDirectory);
-            ProcessBuilder processBuilder = new ProcessBuilder(command)
-                    .directory(bridgeDirectory)
-                    .inheritIO();
-            Map<String, String> environment = processBuilder.environment();
-            environment.put("COURSIER_CACHE",
-                    new File(System.getProperty("java.io.tmpdir"), "quarkus-scala3-coursier").getAbsolutePath());
-            int exitCode = processBuilder.start().waitFor();
-            if (exitCode != 0) {
-                throw new IllegalStateException("sbt-scalajs fastLinkJS exited with code " + exitCode);
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Scala.js linking was interrupted", e);
-        } catch (IOException e) {
-            throw new IllegalStateException("Unable to invoke the sbt-scalajs linker", e);
+            Object config = invokeStatic(STANDARD_CONFIG, "apply");
+            config = invoke(config, "withModuleKind", staticField(ES_MODULE, "MODULE$"));
+            Object modulePackages = List$.MODULE$.from(CollectionConverters.asScala(List.of("my.app")));
+            Object moduleSplit = invoke(staticField(SMALL_MODULES_FOR, "MODULE$"), "apply", modulePackages);
+            config = invoke(config, "withModuleSplitStyle", moduleSplit);
+            config = invoke(config, "withOptimizer", mode.optimizer);
+            config = invoke(config, "withBatchMode", mode == LinkMode.FULL);
+            config = invoke(config, "withSourceMap", true);
+            config = invoke(config, "withRelativizeSourceMapBase", scala.Option.apply(sourceMapBase.toURI()));
+            config = invoke(config, "withOutputPatterns",
+                    invokeStatic(OUTPUT_PATTERNS, "fromJSFile", "scala-js.js"));
+
+            Object effectiveConfig = config;
+            Object linker = linkers.computeIfAbsent(mode,
+                    ignored -> invokeStatic("org.scalajs.linker.StandardImpl", "linker", effectiveConfig));
+            Object initializers = initializers(initializer);
+            Object output = invokeStatic("org.scalajs.linker.PathOutputDirectory", "apply",
+                    outputDirectory.toPath());
+            Method linkMethod = linkerMethod(linker.getClass());
+            Object future = linkMethod.invoke(linker, scalaIrFiles, initializers, output,
+                    linkerLogger(log), executionContext);
+            await(future);
+        } catch (Exception e) {
+            log.error("Scala.js linker invocation failed", e);
+            throw new IllegalStateException("Unable to link Scala.js output", e);
         }
     }
 
-    private static void writeBridge(File bridgeDirectory, List<File> classpath, File outputDirectory,
-            String initializer, File sourceMapBase) throws IOException {
-        File projectDirectory = new File(bridgeDirectory, "project");
-        Files.createDirectories(projectDirectory.toPath());
-        Files.writeString(new File(projectDirectory, "build.properties").toPath(),
-                "sbt.version=" + SBT_VERSION + "\n", StandardCharsets.UTF_8);
-        Files.writeString(new File(projectDirectory, "plugins.sbt").toPath(),
-                "addSbtPlugin(\"org.scala-js\" % \"sbt-scalajs\" % \"" + SCALA_JS_VERSION + "\")\n",
-                StandardCharsets.UTF_8);
-
-        StringBuilder build = new StringBuilder();
-        build.append("import sbt._\nimport Keys._\n");
-        build.append("import org.scalajs.sbtplugin.ScalaJSPlugin.autoImport._\n");
-        build.append(
-                "import org.scalajs.linker.interface.{ModuleInitializer, ModuleKind, ModuleSplitStyle, OutputPatterns}\n\n");
-        build.append("enablePlugins(org.scalajs.sbtplugin.ScalaJSPlugin)\n\n");
-        build.append("Compile / fullClasspath := {\n");
-        build.append("  val converter = fileConverter.value\n  Seq(\n");
-        for (int i = 0; i < classpath.size(); i++) {
-            if (i > 0) {
-                build.append(",\n");
-            }
-            build.append("    Attributed.blank(converter.toVirtualFile(file(\"")
-                    .append(escape(classpath.get(i).getAbsolutePath()))
-                    .append("\").toPath))");
-        }
-        build.append("\n  )\n}\n\n");
-        build.append("scalaJSLinkerConfig ~= {\n");
-        build.append("  _.withModuleKind(ModuleKind.ESModule)\n");
-        build.append("    .withModuleSplitStyle(ModuleSplitStyle.SmallModulesFor(List(\"my.app\")))\n");
-        build.append("  .withSourceMap(true)\n");
-        if (sourceMapBase != null) {
-            build.append("  .withRelativizeSourceMapBase(Some(file(\"")
-                    .append(escape(sourceMapBase.getAbsolutePath()))
-                    .append("\").toURI))\n");
-        }
-        build.append("  .withOutputPatterns(OutputPatterns.fromJSFile(\"scala-js.js\"))}\n");
-        build.append("Compile / fastLinkJS / scalaJSLinkerOutputDirectory := file(\"")
-                .append(escape(outputDirectory.getAbsolutePath())).append("\")\n");
-        if (initializer != null && !initializer.isBlank()) {
-            int separator = initializer.lastIndexOf('#');
-            if (separator < 1 || separator == initializer.length() - 1) {
-                throw new IllegalArgumentException(
-                        "Scala.js initializer must use fully.qualified.Class#method syntax: " + initializer);
-            }
-            build.append("Compile / scalaJSModuleInitializers := Seq(ModuleInitializer.mainMethod(\"")
-                    .append(escape(initializer.substring(0, separator))).append("\", \"")
-                    .append(escape(initializer.substring(separator + 1))).append("\"))\n");
-        }
-        Files.writeString(new File(bridgeDirectory, "build.sbt").toPath(), build.toString(), StandardCharsets.UTF_8);
+    synchronized void close() {
+        irCacheRuns.values().forEach(cache -> invoke(cache, "free"));
+        irCacheRuns.clear();
+        irFileCaches.clear();
+        linkers.clear();
     }
 
-    private static String escape(String value) {
-        return value.replace("\\", "\\\\").replace("\"", "\\\"");
+    private static Object initializers(String initializer) {
+        if (initializer == null || initializer.isBlank()) {
+            return List$.MODULE$.empty();
+        }
+        int separator = initializer.lastIndexOf('#');
+        if (separator < 1 || separator == initializer.length() - 1) {
+            throw new IllegalArgumentException(
+                    "Scala.js initializer must use fully.qualified.Class#method syntax: " + initializer);
+        }
+        Object companion = staticField(MODULE_INITIALIZER, "MODULE$");
+        Object moduleInitializer = invoke(companion, "mainMethod", initializer.substring(0, separator),
+                initializer.substring(separator + 1));
+        return List$.MODULE$.from(CollectionConverters.asScala(List.of(moduleInitializer)));
     }
 
-    private static void addIfMissing(List<File> files, File candidate) {
-        if (candidate != null && !files.contains(candidate)) {
-            files.add(candidate);
+    private static Method linkerMethod(Class<?> linkerClass) {
+        for (Method method : linkerClass.getMethods()) {
+            if (method.getName().equals("link") && method.getParameterCount() == 5
+                    && method.getParameterTypes()[2].getName().endsWith("OutputDirectory")) {
+                return method;
+            }
         }
+        throw new IllegalStateException("Scala.js linker does not expose the OutputDirectory link API");
+    }
+
+    private static Object linkerLogger(Logger log) {
+        Class<?> loggerClass = load(LOGGER);
+        InvocationHandler handler = (proxy, method, args) -> {
+            if (method.getName().equals("log")) {
+                Object level = args[0];
+                String message = String.valueOf(applyFunction(args[1]));
+                String levelName = String.valueOf(level);
+                if (levelName.contains("Error")) {
+                    log.error(message);
+                } else if (levelName.contains("Warn")) {
+                    log.warn(message);
+                } else if (levelName.contains("Info")) {
+                    log.info(message);
+                } else {
+                    log.debug(message);
+                }
+                return null;
+            }
+            if (method.getName().equals("trace")) {
+                log.trace((Throwable) applyFunction(args[0]));
+                return null;
+            }
+            if (method.getName().equals("timeFuture") || method.getName().equals("time")) {
+                if (args.length > 1 && args[1] != null) {
+                    return applyFunction(args[1]);
+                }
+                return null;
+            }
+            if (method.getName().equals("toString")) {
+                return "Quarkus Scala.js linker logger";
+            }
+            return null;
+        };
+        return Proxy.newProxyInstance(loggerClass.getClassLoader(), new Class<?>[] { loggerClass }, handler);
+    }
+
+    private static Object applyFunction(Object function) {
+        try {
+            return scala.Function0.class.getMethod("apply").invoke(function);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Unable to invoke Scala.js linker callback", e);
+        }
+    }
+
+    private static Object staticField(String className, String fieldName) {
+        try {
+            return load(className).getField(fieldName).get(null);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Unable to access Scala.js linker value " + className + "." + fieldName,
+                    e);
+        }
+    }
+
+    private static Object invokeStatic(String className, String methodName, Object... args) {
+        Class<?> type = load(className);
+        for (Method method : type.getMethods()) {
+            if (method.getName().equals(methodName) && method.getParameterCount() == args.length
+                    && compatible(method.getParameterTypes(), args)) {
+                try {
+                    Object receiver = Modifier.isStatic(method.getModifiers()) ? null : staticField(className, "MODULE$");
+                    return method.invoke(receiver, args);
+                } catch (ReflectiveOperationException e) {
+                    throw new IllegalStateException("Unable to invoke " + type.getName() + "." + methodName, e);
+                }
+            }
+        }
+        throw new IllegalStateException("Unable to find " + type.getName() + "." + methodName);
+    }
+
+    private static Object invoke(Object receiver, String methodName, Object... args) {
+        return invoke(receiver, receiver.getClass(), methodName, args);
+    }
+
+    private static Object invoke(Object receiver, Class<?> type, String methodName, Object... args) {
+        for (Method method : type.getMethods()) {
+            if (method.getName().equals(methodName) && method.getParameterCount() == args.length
+                    && compatible(method.getParameterTypes(), args)) {
+                try {
+                    return method.invoke(receiver, args);
+                } catch (ReflectiveOperationException e) {
+                    throw new IllegalStateException("Unable to invoke " + type.getName() + "." + methodName, e);
+                }
+            }
+        }
+        throw new IllegalStateException("Unable to find " + type.getName() + "." + methodName);
+    }
+
+    private static boolean compatible(Class<?>[] parameterTypes, Object[] args) {
+        for (int i = 0; i < parameterTypes.length; i++) {
+            if (args[i] == null) {
+                continue;
+            }
+            Class<?> parameter = box(parameterTypes[i]);
+            if (!parameter.isAssignableFrom(args[i].getClass())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static Class<?> box(Class<?> type) {
+        if (!type.isPrimitive()) {
+            return type;
+        }
+        if (type == boolean.class) {
+            return Boolean.class;
+        }
+        if (type == int.class) {
+            return Integer.class;
+        }
+        if (type == long.class) {
+            return Long.class;
+        }
+        if (type == double.class) {
+            return Double.class;
+        }
+        if (type == float.class) {
+            return Float.class;
+        }
+        if (type == short.class) {
+            return Short.class;
+        }
+        if (type == byte.class) {
+            return Byte.class;
+        }
+        if (type == char.class) {
+            return Character.class;
+        }
+        return type;
+    }
+
+    private static Class<?> load(String className) {
+        try {
+            return Class.forName(className);
+        } catch (ClassNotFoundException e) {
+            throw new IllegalStateException("Missing Scala.js linker class " + className, e);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> T await(Object future) throws Exception {
+        return (T) Await.result((Awaitable<T>) future,
+                Duration$.MODULE$.create(10, TimeUnit.MINUTES));
     }
 }

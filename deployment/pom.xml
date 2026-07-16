@@ -29,6 +29,11 @@
 
     <dependency>
       <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-vertx-http-deployment-spi</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>io.quarkus</groupId>
       <artifactId>quarkus-junit5-internal</artifactId>
       <scope>test</scope>
     </dependency>
@@ -80,6 +85,12 @@
     <dependency>
       <groupId>org.scala-js</groupId>
       <artifactId>scalajs-library_2.13</artifactId>
+      <version>${scalajs.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.scala-js</groupId>
+      <artifactId>scalajs-linker_3</artifactId>
       <version>${scalajs.version}</version>
     </dependency>
 
