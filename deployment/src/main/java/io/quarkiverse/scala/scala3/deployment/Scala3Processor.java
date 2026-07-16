@@ -84,7 +84,7 @@ class Scala3Processor {
                 outputTarget.getOutputDirectory().toFile(), classpath, release);
 
         Set<File> linkerClasspath = Scala3CompilationProvider
-                .compilerClasspath(Scala3CompilationProvider.scalaJsMavenClasspath(classpath));
+                .compilerClasspath(Scala3CompilationProvider.scalaJsMavenClasspath(classpath, sources));
         linkerClasspath.add(outputTarget.getOutputDirectory().toFile());
         linkerClasspath.add(classesDirectory);
         ScalaJsLinkerProcess linker = new ScalaJsLinkerProcess();

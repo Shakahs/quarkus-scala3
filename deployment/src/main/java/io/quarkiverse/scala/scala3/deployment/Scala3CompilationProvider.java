@@ -21,6 +21,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Supplier;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -64,6 +66,7 @@ public final class Scala3CompilationProvider implements CompilationProvider {
     private static final String COMPILER_ARGS_ENV_VAR = "QUARKUS_SCALA3_COMPILER_ARGS";
     private static final String SCALAJS_ENABLED_ENV_VAR = "QUARKUS_SCALA3_SCALAJS";
     private static final String SCALAJS_INITIALIZER_ENV_VAR = "QUARKUS_SCALA3_SCALAJS_INITIALIZER";
+    private static final Pattern SCALA_IMPORT = Pattern.compile("(?m)^\\s*import\\s+([A-Za-z_]\\w*(?:\\.[A-Za-z_]\\w*)*)");
 
     private final Map<String, ProjectState> states = new HashMap<>();
 
@@ -84,7 +87,15 @@ public final class Scala3CompilationProvider implements CompilationProvider {
         }
 
         String stateKey = context.getOutputDirectory().getAbsolutePath();
-        ProjectState state = states.computeIfAbsent(stateKey, ignored -> createState(context, sources.scalaJsEnabled));
+        Set<File> scalaJsMavenClasspath = scalaJsMavenClasspath(context.getClasspath(), sources.scalaJsSources);
+        ProjectState state = states.get(stateKey);
+        if (state == null || !state.usesScalaJsMavenClasspath(scalaJsMavenClasspath)) {
+            if (state != null) {
+                state.close();
+            }
+            state = createState(context, scalaJsMavenClasspath);
+            states.put(stateKey, state);
+        }
         state.compile(sources, context);
     }
 
@@ -94,9 +105,9 @@ public final class Scala3CompilationProvider implements CompilationProvider {
         states.clear();
     }
 
-    private ProjectState createState(Context context, boolean scalaJsEnabled) {
+    private ProjectState createState(Context context, Set<File> scalaJsMavenClasspath) {
         try {
-            return new ProjectState(context, scalaJsEnabled);
+            return new ProjectState(context, scalaJsMavenClasspath);
         } catch (Exception e) {
             LOG.error("Unable to initialize the Scala 3 Zinc compiler", e);
             throw new IllegalStateException("Unable to initialize the Scala 3 Zinc compiler", e);
@@ -179,20 +190,20 @@ public final class Scala3CompilationProvider implements CompilationProvider {
     }
 
     static File sourceSetDirectory(File projectDirectory, File sourceDirectory, boolean testSources) {
+        if (sourceDirectory != null) {
+            File parent = sourceDirectory.getParentFile();
+            if (parent != null && (sourceDirectory.getName().equals("java") || sourceDirectory.getName().equals("scala"))) {
+                return parent;
+            }
+            return sourceDirectory;
+        }
         if (projectDirectory != null) {
             File sourceSet = new File(projectDirectory, testSources ? "src/test" : "src/main");
             if (sourceSet.isDirectory()) {
                 return sourceSet;
             }
         }
-        if (sourceDirectory != null) {
-            File parent = sourceDirectory.getParentFile();
-            if (parent != null && (sourceDirectory.getName().equals("java") || sourceDirectory.getName().equals("scala"))
-                    && (parent.getName().equals("main") || parent.getName().equals("test"))) {
-                return parent;
-            }
-        }
-        return sourceDirectory;
+        return null;
     }
 
     private static ProjectSources discoverSources(File projectDirectory, File configuredSourceDirectory,
@@ -274,7 +285,7 @@ public final class Scala3CompilationProvider implements CompilationProvider {
             return;
         }
         try {
-            Set<File> compilerClasspath = compilerClasspath(scalaJsMavenClasspath(classpath));
+            Set<File> compilerClasspath = compilerClasspath(scalaJsMavenClasspath(classpath, sources));
             Map<File, AnalysisStore> analyses = new HashMap<>();
             File cacheFile = new File(outputDirectory.getParentFile(), "analysis/scalajs-release");
             Target target = new Target(new CompilerEnvironment(compilerClasspath, true), compilerClasspath, true,
@@ -338,15 +349,17 @@ public final class Scala3CompilationProvider implements CompilationProvider {
     private static final class ProjectState {
         private final Set<File> jvmCompilerClasspath;
         private final Set<File> scalaJsCompilerClasspath;
+        private final Set<File> scalaJsMavenClasspath;
         private final Map<File, AnalysisStore> analyses = new HashMap<>();
         private final MultipleOutput outputs;
         private final Target jvmTarget;
         private final Target scalaJsTarget;
         private final ScalaJsLinkerProcess linker = new ScalaJsLinkerProcess();
 
-        private ProjectState(Context context, boolean scalaJsEnabled) throws Exception {
+        private ProjectState(Context context, Set<File> scalaJsMavenClasspath) throws Exception {
             this.jvmCompilerClasspath = compilerClasspath(context);
-            this.scalaJsCompilerClasspath = compilerClasspath(scalaJsMavenClasspath(context.getClasspath()));
+            this.scalaJsMavenClasspath = new LinkedHashSet<>(scalaJsMavenClasspath);
+            this.scalaJsCompilerClasspath = compilerClasspath(scalaJsMavenClasspath);
             this.outputs = outputs(context.getSourceDirectory(), context.getOutputDirectory(),
                     targetDirectory(context, "scalajs-classes"));
             this.jvmTarget = new Target(new CompilerEnvironment(jvmCompilerClasspath, false), jvmCompilerClasspath, false,
@@ -388,6 +401,10 @@ public final class Scala3CompilationProvider implements CompilationProvider {
 
         private void close() {
             linker.close();
+        }
+
+        private boolean usesScalaJsMavenClasspath(Set<File> nextClasspath) {
+            return scalaJsMavenClasspath.equals(nextClasspath);
         }
 
         private static void publishWebResource(File linkerOutput, File classesDirectory) {
@@ -591,11 +608,55 @@ public final class Scala3CompilationProvider implements CompilationProvider {
      * missing or incompatible Scala.js artifact at the point it is actually required.
      */
     static Set<File> scalaJsMavenClasspath(Set<File> classpath) {
+        return scalaJsMavenClasspath(classpath, Collections.emptyList());
+    }
+
+    /**
+     * Replaces only Scala cross-published Maven artifacts whose JVM classes are imported by
+     * Scala.js sources. The dependency is derived from the local classpath; no Maven metadata
+     * lookup is performed.
+     */
+    static Set<File> scalaJsMavenClasspath(Set<File> classpath, List<File> scalaJsSources) {
+        Set<String> imports = scalaJsImports(scalaJsSources);
         Set<File> scalaJsClasspath = new LinkedHashSet<>();
         for (File artifact : classpath) {
-            scalaJsClasspath.add(scalaJsMavenArtifact(artifact));
+            scalaJsClasspath.add(providesImportedType(artifact, imports) ? scalaJsMavenArtifact(artifact) : artifact);
         }
         return scalaJsClasspath;
+    }
+
+    private static Set<String> scalaJsImports(List<File> sources) {
+        Set<String> imports = new LinkedHashSet<>();
+        for (File source : sources) {
+            if (!source.getName().endsWith(".scala")) {
+                continue;
+            }
+            try {
+                Matcher matcher = SCALA_IMPORT.matcher(Files.readString(source.toPath()));
+                while (matcher.find()) {
+                    imports.add(matcher.group(1));
+                }
+            } catch (IOException e) {
+                throw new IllegalStateException("Unable to inspect Scala.js imports in " + source, e);
+            }
+        }
+        return imports;
+    }
+
+    private static boolean providesImportedType(File artifact, Set<String> imports) {
+        if (imports.isEmpty() || !artifact.isFile() || !artifact.getName().endsWith(".jar")) {
+            return false;
+        }
+        try (JarFile jar = new JarFile(artifact)) {
+            return jar.stream()
+                    .map(JarEntry::getName)
+                    .filter(name -> name.endsWith(".class"))
+                    .map(name -> name.substring(0, name.length() - ".class".length()).replace('/', '.'))
+                    .anyMatch(type -> imports.stream().anyMatch(imported -> type.equals(imported)
+                            || type.startsWith(imported + ".") || type.startsWith(imported + "$")));
+        } catch (IOException ignored) {
+            return false;
+        }
     }
 
     private static File scalaJsMavenArtifact(File artifact) {

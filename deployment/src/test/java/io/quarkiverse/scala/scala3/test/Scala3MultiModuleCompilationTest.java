@@ -119,6 +119,34 @@ public class Scala3MultiModuleCompilationTest {
     }
 
     @Test
+    public void configuredSourceSetOverridesDefaultScalaJsRoots() throws Exception {
+        Path module = createModule("configured-source-set");
+        writeSources(module, Map.of(
+                "src/custom/scalajs/application/ConfiguredFrontend.scala", lines(
+                        "package application", "", "import scala.scalajs.js.annotation.JSExportTopLevel", "",
+                        "object ConfiguredFrontend {", "  @JSExportTopLevel(\"configuredFrontend\")",
+                        "  def value(): String = \"configured\"", "}"),
+                "src/main/scalajs/application/DefaultFrontend.scala", lines(
+                        "package application", "", "import scala.scalajs.js.annotation.JSExportTopLevel", "",
+                        "object DefaultFrontend {", "  @JSExportTopLevel(\"defaultFrontend\")",
+                        "  def value(): String = \"default\"", "}")));
+
+        Scala3CompilationProvider provider = new Scala3CompilationProvider();
+        try {
+            Path jvmOutput = module.resolve("target/classes");
+            compile(provider, module, jvmOutput, Set.of(), module.resolve("src/custom/scala"));
+
+            Path scalaJsOutput = module.resolve("target/scalajs-classes/application");
+            assertTrue(Files.isRegularFile(scalaJsOutput.resolve("ConfiguredFrontend.sjsir")),
+                    "the configured source set must provide its own Scala.js root");
+            assertTrue(!Files.exists(scalaJsOutput.resolve("DefaultFrontend.sjsir")),
+                    "the default src/main Scala.js root must not leak into a configured source set");
+        } finally {
+            provider.close();
+        }
+    }
+
+    @Test
     public void siblingModulesWithMixedSourcesFeedTheApplicationJvmAndJsOutputs() throws Exception {
         Path moduleA = createModule("module-a");
         writeSources(moduleA, mixedModuleSources("modulea", "moduleA"));
@@ -245,6 +273,11 @@ public class Scala3MultiModuleCompilationTest {
 
     private static void compile(Scala3CompilationProvider provider, Path module, Path output,
             Set<File> moduleDependencies) {
+        compile(provider, module, output, moduleDependencies, module.resolve("src/main/java"));
+    }
+
+    private static void compile(Scala3CompilationProvider provider, Path module, Path output,
+            Set<File> moduleDependencies, Path sourceDirectory) {
         Set<File> classpath = new HashSet<>();
         classpath.addAll(Arrays.stream(System.getProperty("java.class.path").split(File.pathSeparator))
                 .map(File::new)
@@ -255,7 +288,7 @@ public class Scala3MultiModuleCompilationTest {
                 classpath,
                 classpath,
                 module.toFile(),
-                module.resolve("src/main/java").toFile(),
+                sourceDirectory.toFile(),
                 output.toFile(),
                 "UTF-8",
                 Map.of(),

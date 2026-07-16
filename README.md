@@ -48,10 +48,12 @@ modules and `SmallModulesFor` is derived from the application Scala.js source
 packages, leaving dependency code on Scala.js defaults.
 
 For Scala dependencies declared through Maven, the Scala.js target derives the
-standard cross-published sibling artifact (`name_3` becomes `name_sjs1_3`)
-directly from the resolved classpath. It does not query Maven metadata during
-development or release linking. A library without that Scala.js variant fails
-at Scala.js compilation or linking with the normal compiler diagnostic.
+standard cross-published sibling artifact (`name_3` becomes `name_sjs1_3`) only
+when a Scala.js source imports a type from that dependency. The derivation uses
+the resolved local classpath and does not query Maven metadata during development
+or release linking. Unused JVM-only Scala dependencies remain untouched; an
+imported library without a Scala.js variant fails at compilation or linking with
+the normal compiler diagnostic.
 
 Mark one top-level Scala.js entry point with `@main`; the extension automatically
 adds its generated `main(String[])` module initializer. The legacy

@@ -1,4 +1,4 @@
-package io.quarkiverse.scala.scala3.deployment;
+package io.quarkiverse.scala.scala3.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -15,17 +15,20 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import io.quarkiverse.scala.scala3.deployment.Scala3CompilationProvider;
 import io.quarkus.deployment.annotations.BuildProducer;
 import io.quarkus.deployment.builditem.GeneratedFileSystemResourceBuildItem;
 import io.quarkus.deployment.builditem.GeneratedResourceBuildItem;
 import io.quarkus.deployment.dev.CompilationProvider.Context;
 import io.quarkus.vertx.http.deployment.spi.GeneratedStaticResourceBuildItem;
 
-class Scala3CompilationProviderSourceRootsTest {
+public class Scala3CompilationProviderSourceRootsTest {
 
     @Test
     void compilesGeneratedJavaSources(@TempDir Path project) throws Exception {
@@ -68,6 +71,23 @@ class Scala3CompilationProviderSourceRootsTest {
     }
 
     @Test
+    void usesConfiguredSourceSetForScalaJsRoots(@TempDir Path project) throws Exception {
+        Path configuredScalaRoot = project.resolve("src/custom/scala");
+        Path configuredScalaJs = project.resolve("src/custom/scalajs/ConfiguredFrontend.scala");
+        Path defaultScalaJs = project.resolve("src/main/scalajs/DefaultFrontend.scala");
+        Files.createDirectories(configuredScalaRoot);
+        Files.createDirectories(configuredScalaJs.getParent());
+        Files.createDirectories(defaultScalaJs.getParent());
+        Files.writeString(configuredScalaJs, "object ConfiguredFrontend\n", StandardCharsets.UTF_8);
+        Files.writeString(defaultScalaJs, "object DefaultFrontend\n", StandardCharsets.UTF_8);
+
+        assertEquals(List.of(configuredScalaJs.toFile()),
+                invokeProvider("scalaJsSources", new Class<?>[] { File.class, File.class, boolean.class },
+                        project.toFile(), configuredScalaRoot.toFile(), false),
+                "an explicit source root must override the default src/main Scala.js source set");
+    }
+
+    @Test
     void publishesEveryScalaJsModuleSplitOutput(@TempDir Path project) throws Exception {
         Path linkOutput = project.resolve("target/scalajs");
         Files.createDirectories(linkOutput);
@@ -93,11 +113,15 @@ class Scala3CompilationProviderSourceRootsTest {
         Files.createDirectories(source.getParent());
         Files.writeString(source, "package application.frontend\n\nobject Main\n", StandardCharsets.UTF_8);
 
-        List<String> packages = Scala3CompilationProvider.scalaJsApplicationPackages(List.of(source.toFile()));
+        List<String> packages = invokeProvider("scalaJsApplicationPackages", new Class<?>[] { List.class },
+                List.of(source.toFile()));
         assertEquals(List.of("application"), packages,
                 "the application package must be inferred from its Scala.js source rather than hard-coded");
 
-        Object splitStyle = ScalaJsLinkerProcess.moduleSplitStyle(packages);
+        Class<?> linker = Class.forName("io.quarkiverse.scala.scala3.deployment.ScalaJsLinkerProcess");
+        Method moduleSplitStyle = linker.getDeclaredMethod("moduleSplitStyle", List.class);
+        moduleSplitStyle.setAccessible(true);
+        Object splitStyle = moduleSplitStyle.invoke(null, packages);
         assertEquals("List(application)", splitStyle.getClass().getMethod("packages").invoke(splitStyle).toString(),
                 "the linker must apply SmallModulesFor to the inferred application package");
     }
@@ -107,19 +131,27 @@ class Scala3CompilationProviderSourceRootsTest {
             throws Exception {
         Path jvmArtifact = repository.resolve("com/example/widget_3/1.0.0/widget_3-1.0.0.jar");
         Files.createDirectories(jvmArtifact.getParent());
-        Files.writeString(jvmArtifact, "jvm artifact", StandardCharsets.UTF_8);
+        writeJar(jvmArtifact, "com/example/widget/Widget.class");
+        Path unusedJvmArtifact = repository.resolve("com/example/unused_3/1.0.0/unused_3-1.0.0.jar");
+        Files.createDirectories(unusedJvmArtifact.getParent());
+        writeJar(unusedJvmArtifact, "com/example/unused/Unused.class");
         Path javaArtifact = repository.resolve("com/example/java-widget/1.0.0/java-widget-1.0.0.jar");
         Files.createDirectories(javaArtifact.getParent());
-        Files.writeString(javaArtifact, "java artifact", StandardCharsets.UTF_8);
+        writeJar(javaArtifact, "com/example/javawidget/JavaWidget.class");
+        Path source = repository.resolve("src/main/scalajs/Frontend.scala");
+        Files.createDirectories(source.getParent());
+        Files.writeString(source, "import com.example.widget.Widget\n\nobject Frontend\n", StandardCharsets.UTF_8);
 
-        Set<File> scalaJsClasspath = Scala3CompilationProvider.scalaJsMavenClasspath(
-                Set.of(jvmArtifact.toFile(), javaArtifact.toFile()));
+        Set<File> scalaJsClasspath = invokeProvider("scalaJsMavenClasspath", new Class<?>[] { Set.class, List.class },
+                Set.of(jvmArtifact.toFile(), unusedJvmArtifact.toFile(), javaArtifact.toFile()), List.of(source.toFile()));
 
         assertTrue(scalaJsClasspath.contains(
                 repository.resolve("com/example/widget_sjs1_3/1.0.0/widget_sjs1_3-1.0.0.jar").toFile()),
                 "Scala.js must derive the cross-published artifact path locally, without querying Maven");
         assertTrue(scalaJsClasspath.contains(javaArtifact.toFile()),
                 "ordinary Java artifacts must remain on the Scala.js classpath");
+        assertTrue(scalaJsClasspath.contains(unusedJvmArtifact.toFile()),
+                "an unused JVM-only Scala dependency must not be replaced preemptively");
         assertTrue(!scalaJsClasspath.contains(jvmArtifact.toFile()),
                 "the JVM Scala artifact must be replaced so a missing Scala.js variant fails compilation clearly");
     }
@@ -156,8 +188,18 @@ class Scala3CompilationProviderSourceRootsTest {
                 StandardCharsets.UTF_8);
     }
 
+    private static void writeJar(Path path, String... entries) throws IOException {
+        try (ZipOutputStream output = new ZipOutputStream(Files.newOutputStream(path))) {
+            for (String entry : entries) {
+                output.putNextEntry(new ZipEntry(entry));
+                output.closeEntry();
+            }
+        }
+    }
+
     private static void invokeReleasePublisher(Path linkOutput, Path classes) throws Exception {
-        Method publish = Scala3Processor.class.getDeclaredMethod("publish", File.class, File.class,
+        Class<?> processor = Class.forName("io.quarkiverse.scala.scala3.deployment.Scala3Processor");
+        Method publish = processor.getDeclaredMethod("publish", File.class, File.class,
                 BuildProducer.class, BuildProducer.class, BuildProducer.class);
         publish.setAccessible(true);
         BuildProducer<GeneratedResourceBuildItem> resources = ignored -> {
@@ -167,6 +209,13 @@ class Scala3CompilationProviderSourceRootsTest {
         BuildProducer<GeneratedStaticResourceBuildItem> staticResources = ignored -> {
         };
         publish.invoke(null, linkOutput.toFile(), classes.toFile(), resources, fileSystemResources, staticResources);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> T invokeProvider(String methodName, Class<?>[] parameterTypes, Object... arguments) throws Exception {
+        Method method = Scala3CompilationProvider.class.getDeclaredMethod(methodName, parameterTypes);
+        method.setAccessible(true);
+        return (T) method.invoke(null, arguments);
     }
 
     private static void invokeDevPublisher(Path linkOutput, Path classes) throws Exception {
