@@ -61,7 +61,9 @@ class Scala3Processor {
 
         Properties buildProperties = outputTarget.getBuildSystemProperties();
         File sourceDirectory = sourceDirectory(buildProperties, outputTarget.getOutputDirectory());
-        List<File> sources = Scala3CompilationProvider.scalaJsSources(sourceDirectory);
+        File projectDirectory = projectDirectory(buildProperties, outputTarget.getOutputDirectory());
+        File sourceSetDirectory = Scala3CompilationProvider.sourceSetDirectory(projectDirectory, sourceDirectory, false);
+        List<File> sources = Scala3CompilationProvider.scalaJsSources(projectDirectory, sourceDirectory, false);
         LOG.infof("Scala.js release link in %s mode: sourceDirectory=%s, sources=%d",
                 launchMode.getLaunchMode(), sourceDirectory, sources.size());
         if (sources.isEmpty()) {
@@ -78,7 +80,7 @@ class Scala3Processor {
         File linkOutput = outputTarget.getOutputDirectory()
                 .resolveSibling("scalajs").toFile();
         String release = buildProperties.getProperty("maven.compiler.release", "17");
-        Scala3CompilationProvider.compileScalaJsForRelease(sources, sourceDirectory, classesDirectory,
+        Scala3CompilationProvider.compileScalaJsForRelease(sources, sourceSetDirectory, classesDirectory,
                 outputTarget.getOutputDirectory().toFile(), classpath, release);
 
         Set<File> linkerClasspath = Scala3CompilationProvider.compilerClasspath(classpath);
@@ -87,7 +89,7 @@ class Scala3Processor {
         ScalaJsLinkerProcess linker = new ScalaJsLinkerProcess();
         try {
             linker.link(linkerClasspath, linkOutput, System.getenv("QUARKUS_SCALA3_SCALAJS_INITIALIZER"),
-                    sourceDirectory, ScalaJsLinkerProcess.LinkMode.FULL,
+                    sourceSetDirectory, ScalaJsLinkerProcess.LinkMode.FULL,
                     LOG);
             publish(linkOutput, outputTarget.getOutputDirectory().toFile(), generatedResources,
                     generatedFileSystemResources, generatedStaticResources);
@@ -121,27 +123,31 @@ class Scala3Processor {
                         .orElseGet(() -> candidates.get(0)));
     }
 
+    private static File projectDirectory(Properties properties, Path outputDirectory) {
+        String configured = properties.getProperty("project.basedir");
+        if (configured != null && !configured.isBlank()) {
+            return new File(configured);
+        }
+        Path parent = outputDirectory.getParent();
+        return (parent == null ? outputDirectory : parent.getParent()).toFile();
+    }
+
     private static void publish(File linkOutput, File classesDirectory,
             BuildProducer<GeneratedResourceBuildItem> generatedResources,
             BuildProducer<GeneratedFileSystemResourceBuildItem> generatedFileSystemResources,
             BuildProducer<GeneratedStaticResourceBuildItem> generatedStaticResources) {
-        for (String name : List.of("scala-js.js", "scala-js.js.map")) {
-            Path file = linkOutput.toPath().resolve(name);
-            if (Files.isRegularFile(file)) {
-                try {
-                    byte[] data = Files.readAllBytes(file);
-                    Path resource = classesDirectory.toPath().resolve("META-INF/resources/scala-js").resolve(name);
-                    Files.createDirectories(resource.getParent());
-                    Files.write(resource, data);
-                    generatedResources.produce(new GeneratedResourceBuildItem(
-                            "META-INF/resources/scala-js/" + name, data));
-                    generatedFileSystemResources.produce(new GeneratedFileSystemResourceBuildItem(
-                            "META-INF/resources/scala-js/" + name, data));
-                    generatedStaticResources.produce(new GeneratedStaticResourceBuildItem(
-                            "/scala-js/" + name, data));
-                } catch (IOException e) {
-                    throw new IllegalStateException("Unable to publish Scala.js release resource " + file, e);
-                }
+        Scala3CompilationProvider.publishWebResources(linkOutput, classesDirectory);
+        Path outputRoot = linkOutput.toPath();
+        for (Path file : Scala3CompilationProvider.linkedOutputFiles(linkOutput)) {
+            String name = outputRoot.relativize(file).toString().replace(File.separatorChar, '/');
+            try {
+                byte[] data = Files.readAllBytes(file);
+                generatedResources.produce(new GeneratedResourceBuildItem("META-INF/resources/scala-js/" + name, data));
+                generatedFileSystemResources
+                        .produce(new GeneratedFileSystemResourceBuildItem("META-INF/resources/scala-js/" + name, data));
+                generatedStaticResources.produce(new GeneratedStaticResourceBuildItem("/scala-js/" + name, data));
+            } catch (IOException e) {
+                throw new IllegalStateException("Unable to publish Scala.js release resource " + file, e);
             }
         }
     }

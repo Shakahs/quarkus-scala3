@@ -61,7 +61,6 @@ public final class Scala3CompilationProvider implements CompilationProvider {
     private static final Set<String> HANDLED_EXTENSIONS = Set.of(".scala", ".java");
     private static final String COMPILER_ARGS_ENV_VAR = "QUARKUS_SCALA3_COMPILER_ARGS";
     private static final String SCALAJS_ENABLED_ENV_VAR = "QUARKUS_SCALA3_SCALAJS";
-    private static final String SCALAJS_MODE_ENV_VAR = "QUARKUS_SCALA3_SCALAJS_MODE";
     private static final String SCALAJS_INITIALIZER_ENV_VAR = "QUARKUS_SCALA3_SCALAJS_INITIALIZER";
 
     private final Map<String, ProjectState> states = new HashMap<>();
@@ -103,51 +102,9 @@ public final class Scala3CompilationProvider implements CompilationProvider {
     }
 
     private static ProjectSources findSources(Context context) {
-        File sourceDirectory = context.getSourceDirectory();
-        if (context.getProjectDirectory() != null) {
-            String sourceSet = context.getOutputDirectory().getName().equals("test-classes") ? "src/test" : "src/main";
-            File projectSourceSet = new File(context.getProjectDirectory(), sourceSet);
-            if (projectSourceSet.isDirectory()) {
-                sourceDirectory = projectSourceSet;
-            }
-        }
-        if (sourceDirectory == null || !sourceDirectory.isDirectory()) {
-            return ProjectSources.empty();
-        }
-
-        try (var stream = Files.walk(sourceDirectory.toPath())) {
-            List<File> allSources = stream.filter(Files::isRegularFile)
-                    .map(Path::toFile)
-                    .filter(file -> file.getName().endsWith(".scala") || file.getName().endsWith(".java"))
-                    .sorted(Comparator.comparing(File::getAbsolutePath))
-                    .collect(Collectors.toList());
-
-            Path sourceSet = sourceDirectory.toPath().toAbsolutePath().normalize();
-            List<Path> scalaJsRoots = List.of(
-                    sourceSet.resolve("scalajs"),
-                    sourceSet.resolve("java/scalajs"),
-                    sourceSet.resolve("scala/scalajs"));
-            List<Path> sharedRoots = List.of(
-                    sourceSet.resolve("shared"),
-                    sourceSet.resolve("java/shared"),
-                    sourceSet.resolve("scala/shared"));
-            boolean wholeProject = "whole".equalsIgnoreCase(System.getenv(SCALAJS_MODE_ENV_VAR));
-            boolean explicitlyEnabled = Boolean.parseBoolean(System.getenv(SCALAJS_ENABLED_ENV_VAR));
-
-            List<File> jvmSources = allSources.stream()
-                    .filter(file -> scalaJsRoots.stream().noneMatch(root -> isUnder(file.toPath(), root)))
-                    .collect(Collectors.toList());
-            List<File> scalaJsSources = allSources.stream()
-                    .filter(file -> file.getName().endsWith(".scala"))
-                    .filter(file -> wholeProject
-                            || scalaJsRoots.stream().anyMatch(root -> isUnder(file.toPath(), root))
-                            || sharedRoots.stream().anyMatch(root -> isUnder(file.toPath(), root)))
-                    .collect(Collectors.toList());
-
-            return new ProjectSources(jvmSources, scalaJsSources, explicitlyEnabled || !scalaJsSources.isEmpty());
-        } catch (IOException e) {
-            throw new IllegalStateException("Unable to enumerate sources under " + sourceDirectory, e);
-        }
+        boolean testSources = context.getOutputDirectory().getName().equals("test-classes");
+        return discoverSources(context.getProjectDirectory(), context.getSourceDirectory(),
+                context.getGeneratedSourcesDirectory(), testSources);
     }
 
     private static boolean isUnder(Path file, Path directory) {
@@ -166,28 +123,100 @@ public final class Scala3CompilationProvider implements CompilationProvider {
     }
 
     static List<File> scalaJsSources(File sourceDirectory) {
-        if (sourceDirectory == null || !sourceDirectory.isDirectory()) {
+        return discoverSources(null, sourceDirectory, null, false).scalaJsSources;
+    }
+
+    static List<File> scalaJsSources(File projectDirectory, File sourceDirectory, boolean testSources) {
+        return discoverSources(projectDirectory, sourceDirectory, null, testSources).scalaJsSources;
+    }
+
+    static File sourceSetDirectory(File projectDirectory, File sourceDirectory, boolean testSources) {
+        if (projectDirectory != null) {
+            File sourceSet = new File(projectDirectory, testSources ? "src/test" : "src/main");
+            if (sourceSet.isDirectory()) {
+                return sourceSet;
+            }
+        }
+        if (sourceDirectory != null) {
+            File parent = sourceDirectory.getParentFile();
+            if (parent != null && (sourceDirectory.getName().equals("java") || sourceDirectory.getName().equals("scala"))
+                    && (parent.getName().equals("main") || parent.getName().equals("test"))) {
+                return parent;
+            }
+        }
+        return sourceDirectory;
+    }
+
+    private static ProjectSources discoverSources(File projectDirectory, File configuredSourceDirectory,
+            File generatedSourcesDirectory, boolean testSources) {
+        File sourceSet = sourceSetDirectory(projectDirectory, configuredSourceDirectory, testSources);
+        File primarySourceDirectory = defaultSourceDirectory(projectDirectory, configuredSourceDirectory, testSources)
+                ? sourceSet
+                : configuredSourceDirectory;
+        LinkedHashSet<File> roots = new LinkedHashSet<>();
+        addDirectory(roots, primarySourceDirectory);
+        addDirectory(roots, generatedSourcesDirectory);
+
+        List<Path> scalaJsRoots = sourceRoots(sourceSet, "scalajs");
+        List<Path> sharedRoots = sourceRoots(sourceSet, "shared");
+        scalaJsRoots.forEach(path -> addDirectory(roots, path.toFile()));
+        sharedRoots.forEach(path -> addDirectory(roots, path.toFile()));
+
+        List<File> allSources = roots.stream()
+                .flatMap(root -> sourcesUnder(root).stream())
+                .distinct()
+                .sorted(Comparator.comparing(File::getAbsolutePath))
+                .collect(Collectors.toList());
+        if (allSources.isEmpty()) {
+            return ProjectSources.empty();
+        }
+
+        List<File> jvmSources = allSources.stream()
+                .filter(file -> scalaJsRoots.stream().noneMatch(root -> isUnder(file.toPath(), root)))
+                .collect(Collectors.toList());
+        List<File> scalaJsSources = allSources.stream()
+                .filter(file -> file.getName().endsWith(".scala"))
+                .filter(file -> scalaJsRoots.stream().anyMatch(root -> isUnder(file.toPath(), root))
+                        || sharedRoots.stream().anyMatch(root -> isUnder(file.toPath(), root)))
+                .collect(Collectors.toList());
+        boolean explicitlyEnabled = Boolean.parseBoolean(System.getenv(SCALAJS_ENABLED_ENV_VAR));
+        return new ProjectSources(jvmSources, scalaJsSources, explicitlyEnabled || !scalaJsSources.isEmpty());
+    }
+
+    private static boolean defaultSourceDirectory(File projectDirectory, File sourceDirectory, boolean testSources) {
+        if (projectDirectory == null || sourceDirectory == null) {
+            return false;
+        }
+        Path configured = sourceDirectory.toPath().toAbsolutePath().normalize();
+        Path javaRoot = new File(projectDirectory, testSources ? "src/test/java" : "src/main/java").toPath()
+                .toAbsolutePath().normalize();
+        Path scalaRoot = new File(projectDirectory, testSources ? "src/test/scala" : "src/main/scala").toPath()
+                .toAbsolutePath().normalize();
+        return configured.equals(javaRoot) || configured.equals(scalaRoot);
+    }
+
+    private static List<Path> sourceRoots(File sourceSet, String name) {
+        if (sourceSet == null) {
             return Collections.emptyList();
         }
-        try (var stream = Files.walk(sourceDirectory.toPath())) {
-            Path sourceSet = sourceDirectory.toPath().toAbsolutePath().normalize();
-            List<Path> scalaJsRoots = List.of(
-                    sourceSet.resolve("scalajs"),
-                    sourceSet.resolve("java/scalajs"),
-                    sourceSet.resolve("scala/scalajs"));
-            List<Path> sharedRoots = List.of(
-                    sourceSet.resolve("shared"),
-                    sourceSet.resolve("java/shared"),
-                    sourceSet.resolve("scala/shared"));
+        Path root = sourceSet.toPath().toAbsolutePath().normalize();
+        return List.of(root.resolve(name), root.resolve("java").resolve(name), root.resolve("scala").resolve(name));
+    }
+
+    private static void addDirectory(Set<File> roots, File directory) {
+        if (directory != null && directory.isDirectory()) {
+            roots.add(directory);
+        }
+    }
+
+    private static List<File> sourcesUnder(File directory) {
+        try (var stream = Files.walk(directory.toPath())) {
             return stream.filter(Files::isRegularFile)
                     .map(Path::toFile)
-                    .filter(file -> file.getName().endsWith(".scala"))
-                    .filter(file -> scalaJsRoots.stream().anyMatch(root -> isUnder(file.toPath(), root))
-                            || sharedRoots.stream().anyMatch(root -> isUnder(file.toPath(), root)))
-                    .sorted(Comparator.comparing(File::getAbsolutePath))
+                    .filter(file -> file.getName().endsWith(".scala") || file.getName().endsWith(".java"))
                     .collect(Collectors.toList());
         } catch (IOException e) {
-            throw new IllegalStateException("Unable to enumerate Scala.js sources under " + sourceDirectory, e);
+            throw new IllegalStateException("Unable to enumerate sources under " + directory, e);
         }
     }
 
@@ -206,6 +235,39 @@ public final class Scala3CompilationProvider implements CompilationProvider {
             target.compile(sources, outputDirectory, Charset.defaultCharset(), release);
         } catch (Exception e) {
             throw new IllegalStateException("Unable to compile Scala.js sources for the Quarkus release build", e);
+        }
+    }
+
+    static List<Path> linkedOutputFiles(File linkerOutput) {
+        if (linkerOutput == null || !linkerOutput.isDirectory()) {
+            return Collections.emptyList();
+        }
+        try (var stream = Files.walk(linkerOutput.toPath())) {
+            return stream.filter(Files::isRegularFile).sorted().collect(Collectors.toList());
+        } catch (IOException e) {
+            throw new IllegalStateException("Unable to enumerate Scala.js linker output " + linkerOutput, e);
+        }
+    }
+
+    static void publishWebResources(File linkerOutput, File classesDirectory) {
+        Path resourceDirectory = classesDirectory.toPath().resolve("META-INF/resources/scala-js");
+        try {
+            if (Files.exists(resourceDirectory)) {
+                try (var stream = Files.walk(resourceDirectory)) {
+                    for (Path path : stream.sorted(Comparator.reverseOrder()).collect(Collectors.toList())) {
+                        Files.delete(path);
+                    }
+                }
+            }
+            Files.createDirectories(resourceDirectory);
+            Path outputRoot = linkerOutput.toPath();
+            for (Path source : linkedOutputFiles(linkerOutput)) {
+                Path destination = resourceDirectory.resolve(outputRoot.relativize(source));
+                Files.createDirectories(destination.getParent());
+                Files.copy(source, destination, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("Unable to publish Scala.js web resources", e);
         }
     }
 
@@ -276,19 +338,7 @@ public final class Scala3CompilationProvider implements CompilationProvider {
         }
 
         private static void publishWebResource(File linkerOutput, File classesDirectory) {
-            try {
-                File resourceDirectory = new File(classesDirectory, "META-INF/resources/scala-js");
-                Files.createDirectories(resourceDirectory.toPath());
-                for (String name : List.of("scala-js.js", "scala-js.js.map")) {
-                    File source = new File(linkerOutput, name);
-                    if (source.isFile()) {
-                        Files.copy(source.toPath(), new File(resourceDirectory, name).toPath(),
-                                StandardCopyOption.REPLACE_EXISTING);
-                    }
-                }
-            } catch (IOException e) {
-                throw new IllegalStateException("Unable to publish Scala.js web resources", e);
-            }
+            Scala3CompilationProvider.publishWebResources(linkerOutput, classesDirectory);
         }
     }
 
