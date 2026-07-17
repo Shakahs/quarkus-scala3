@@ -12,6 +12,7 @@
   <packaging>pom</packaging>
   <name>Quarkus - Scala3 - Parent</name>
   <modules>
+    <module>maven-bootstrap</module>
     <module>deployment</module>
     <module>runtime</module>
   </modules>
