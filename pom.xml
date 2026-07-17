@@ -14,6 +14,7 @@
   <modules>
     <module>maven-bootstrap</module>
     <module>deployment</module>
+    <module>maven-compiler</module>
     <module>runtime</module>
   </modules>
   <scm>

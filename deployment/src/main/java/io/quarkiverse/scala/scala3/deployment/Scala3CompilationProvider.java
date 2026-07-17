@@ -218,6 +218,7 @@ public final class Scala3CompilationProvider implements CompilationProvider {
 
         List<Path> scalaJsRoots = sourceRoots(sourceSet, "scalajs");
         List<Path> sharedRoots = sourceRoots(sourceSet, "shared");
+        Set<Path> generatedScalaJsSources = generatedScalaJsSources(generatedSourcesDirectory);
         scalaJsRoots.forEach(path -> addDirectory(roots, path.toFile()));
         sharedRoots.forEach(path -> addDirectory(roots, path.toFile()));
 
@@ -232,14 +233,44 @@ public final class Scala3CompilationProvider implements CompilationProvider {
 
         List<File> jvmSources = allSources.stream()
                 .filter(file -> scalaJsRoots.stream().noneMatch(root -> isUnder(file.toPath(), root)))
+                .filter(file -> !generatedScalaJsSources.contains(file.toPath().toAbsolutePath().normalize()))
                 .collect(Collectors.toList());
         List<File> scalaJsSources = allSources.stream()
                 .filter(file -> file.getName().endsWith(".scala"))
                 .filter(file -> scalaJsRoots.stream().anyMatch(root -> isUnder(file.toPath(), root))
-                        || sharedRoots.stream().anyMatch(root -> isUnder(file.toPath(), root)))
+                        || sharedRoots.stream().anyMatch(root -> isUnder(file.toPath(), root))
+                        || generatedScalaJsSources.contains(file.toPath().toAbsolutePath().normalize()))
                 .collect(Collectors.toList());
         boolean explicitlyEnabled = Boolean.parseBoolean(System.getenv(SCALAJS_ENABLED_ENV_VAR));
         return new ProjectSources(jvmSources, scalaJsSources, explicitlyEnabled || !scalaJsSources.isEmpty());
+    }
+
+    /**
+     * ScalablyTyped writes its facades to the managed/generated source directory. Those
+     * facades are Scala.js sources even though they do not live below a conventional
+     * {@code scalajs} source root. Keep ordinary generated JVM sources on the JVM target.
+     */
+    private static Set<Path> generatedScalaJsSources(File generatedSourcesDirectory) {
+        if (generatedSourcesDirectory == null || !generatedSourcesDirectory.isDirectory()) {
+            return Collections.emptySet();
+        }
+        return sourcesUnder(generatedSourcesDirectory).stream()
+                .filter(file -> file.getName().endsWith(".scala"))
+                .filter(Scala3CompilationProvider::isScalaJsSource)
+                .map(file -> file.toPath().toAbsolutePath().normalize())
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+    }
+
+    private static boolean isScalaJsSource(File source) {
+        try {
+            String text = Files.readString(source.toPath());
+            return text.contains("scala.scalajs.")
+                    || text.contains("org.scalajs.")
+                    || text.contains("@JSImport")
+                    || text.contains("@JSGlobal");
+        } catch (IOException e) {
+            throw new IllegalStateException("Unable to inspect generated source " + source, e);
+        }
     }
 
     private static boolean defaultSourceDirectory(File projectDirectory, File sourceDirectory, boolean testSources) {
@@ -295,6 +326,37 @@ public final class Scala3CompilationProvider implements CompilationProvider {
         } catch (Exception e) {
             throw new IllegalStateException("Unable to compile Scala.js sources for the Quarkus release build", e);
         }
+    }
+
+    /**
+     * Compiles JVM Scala sources from Maven's normal compile lifecycle. This keeps Maven
+     * test discovery independent of a separately configured Scala compiler plugin.
+     */
+    public static void compileJvmForMaven(List<File> sources, File sourceRoot, File outputDirectory,
+            Set<File> classpath, String release) {
+        if (sources.isEmpty()) {
+            return;
+        }
+        try {
+            Set<File> compilerClasspath = compilerClasspath(classpath);
+            Map<File, AnalysisStore> analyses = new HashMap<>();
+            File cacheFile = new File(outputDirectory.getParentFile(), "analysis/maven-scala");
+            // Maven may remove or replace target/classes independently of this extension.
+            // A retained Zinc analysis would then regard the Scala sources as current and
+            // skip recreating their missing class files. Maven lifecycle compilation must
+            // leave a complete output directory, so do not reuse that volatile analysis.
+            Files.deleteIfExists(cacheFile.toPath());
+            Target target = new Target(new CompilerEnvironment(compilerClasspath, false), compilerClasspath, false,
+                    outputDirectory, cacheFile, analyses, sourceRoot,
+                    ProjectState.outputs(sourceRoot, outputDirectory, targetDirectory(outputDirectory, "scalajs-classes")));
+            target.compile(sources, outputDirectory, Charset.defaultCharset(), release);
+        } catch (Exception e) {
+            throw new IllegalStateException("Unable to compile Scala sources for the Maven lifecycle", e);
+        }
+    }
+
+    private static File targetDirectory(File outputDirectory, String name) {
+        return new File(outputDirectory.getParentFile(), name);
     }
 
     static List<Path> linkedOutputFiles(File linkerOutput) {

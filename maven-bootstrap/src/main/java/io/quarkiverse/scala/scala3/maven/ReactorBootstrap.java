@@ -15,7 +15,7 @@ final class ReactorBootstrap {
     }
 
     static void ensureBuilt(Path projectDirectory, List<String> goals, CommandRunner runner) throws Exception {
-        if (!goals.contains("quarkus:dev"))
+        if (!goals.contains("quarkus:dev") && !goals.contains("test"))
             return;
         Path root = root(projectDirectory);
         if (root == null || root.equals(projectDirectory))
@@ -26,6 +26,10 @@ final class ReactorBootstrap {
                         "-Dquarkus.registry-client.enabled=false"));
         if (runner.run(List.copyOf(command)) != 0)
             throw new IOException("Maven reactor bootstrap failed for " + projectDirectory);
+    }
+
+    static boolean skipsScalafix(List<String> goals) {
+        return goals.contains("test");
     }
 
     private static Path root(Path projectDirectory) throws IOException {

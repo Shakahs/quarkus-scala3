@@ -38,7 +38,9 @@ By default the extension discovers sources recursively below `src/main` (and
 `src/test` for tests), unless Maven configures a different source root. Scala.js
 sources belong below `src/main/scalajs`, `src/main/scala/scalajs`, or
 `src/main/java/scalajs`. Sources below the corresponding `shared` directories
-are compiled for both JVM and Scala.js targets. Generated sources remain JVM-only.
+are compiled for both JVM and Scala.js targets. Ordinary generated sources remain
+JVM-only; generated Scala.js facades such as ScalablyTyped output are compiled
+for Scala.js as well.
 
 Quarkus watches the sources and invokes the stateful Zinc provider. Zinc performs
 the mixed Java/Scala incremental compilation, while the extension invokes the
@@ -65,6 +67,35 @@ serves as normal web resources.
 The extension works alongside `quarkus-web-bundler`: Scala.js output is served
 as a normal Quarkus resource, while web-bundler continues to bundle local
 JavaScript/TypeScript and Maven-resolved npm dependencies from `src/main/resources/web`.
+
+#### ScalablyTyped facades
+
+When the Scala.js build uses ScalablyTyped to generate facades for npm packages,
+install the npm package and its TypeScript inputs in the project that owns the
+Scala.js sources:
+
+```bash
+npm install -S chart.js@2.9.4
+npm install -D @types/chart.js@2.9.29 typescript@4.9.5
+```
+
+Enable the converter in `project/plugins.sbt`:
+
+```scala
+addSbtPlugin("org.scalajs.converter" % "sbt-converter" % "1.0.0-beta44")
+```
+
+and in `build.sbt`:
+
+```scala
+enablePlugins(ScalablyTypedConverterExternalNpmPlugin)
+
+externalNpm := baseDirectory.value
+```
+
+The extension recognizes Scala.js facades generated in the managed source
+directory and compiles them to the Scala.js target. Ordinary generated JVM
+sources remain JVM-only.
 
 
 ## Installation

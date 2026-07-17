@@ -49,6 +49,40 @@ public class Scala3CompilationProviderSourceRootsTest {
     }
 
     @Test
+    void compilesScalablyTypedFacadesForScalaJs(@TempDir Path project) throws Exception {
+        Path sourceDirectory = project.resolve("src/main/java");
+        Path generatedSources = project.resolve("target/generated-sources/scala");
+        Path generatedSource = generatedSources.resolve("generated/Lodash.scala");
+        Files.createDirectories(generatedSource.getParent());
+        Files.writeString(generatedSource,
+                "package generated\n\n"
+                        + "import scala.scalajs.js\n"
+                        + "import scala.scalajs.js.annotation.JSImport\n\n"
+                        + "@JSImport(\"lodash\", \"kebabCase\")\n"
+                        + "@js.native\n"
+                        + "object Lodash extends js.Function1[String, String] {\n"
+                        + "  def apply(value: String): String = js.native\n"
+                        + "}\n",
+                StandardCharsets.UTF_8);
+
+        Scala3CompilationProvider provider = new Scala3CompilationProvider();
+        try {
+            Path classes = project.resolve("target/classes");
+            compile(provider, project, sourceDirectory, generatedSources, classes);
+            List<Path> scalaJsOutputs;
+            try (var paths = Files.walk(project.resolve("target/scalajs-classes"))) {
+                scalaJsOutputs = paths.collect(Collectors.toList());
+            }
+            assertTrue(scalaJsOutputs.stream().anyMatch(path -> path.getFileName().toString().equals("Lodash$.sjsir")),
+                    "ScalablyTyped-generated Scala.js facades must compile to the Scala.js target: " + scalaJsOutputs);
+            assertTrue(!Files.exists(classes.resolve("generated/Lodash.class")),
+                    "ScalablyTyped-generated Scala.js facades must not leak into the JVM target");
+        } finally {
+            provider.close();
+        }
+    }
+
+    @Test
     void preservesQuarkusConfiguredSourceDirectory(@TempDir Path project) throws Exception {
         Path conventionalSourceRoot = project.resolve("src/main/java");
         Files.createDirectories(conventionalSourceRoot);

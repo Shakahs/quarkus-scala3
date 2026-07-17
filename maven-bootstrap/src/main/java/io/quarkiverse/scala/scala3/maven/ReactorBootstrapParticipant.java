@@ -15,6 +15,11 @@ public final class ReactorBootstrapParticipant extends AbstractMavenLifecyclePar
 
     @Override
     public void afterProjectsRead(MavenSession session) throws MavenExecutionException {
+        session.getProjects().forEach(
+                project -> Scala3MavenCompilerConfigurator.configure(project.getModel(), project.getGroupId()));
+        if (ReactorBootstrap.skipsScalafix(session.getRequest().getGoals())) {
+            session.getUserProperties().setProperty("scalafix.skip", "true");
+        }
         if (session.getProjects().size() != 1) {
             return;
         }
