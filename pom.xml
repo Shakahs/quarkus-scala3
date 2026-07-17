@@ -29,6 +29,7 @@
     <java.version>25</java.version>
     <maven.compiler.release>${java.version}</maven.compiler.release>
     <maven.version>3.9.11</maven.version>
+    <impsort.version>1.13.0</impsort.version>
     <quarkus.version>3.37.3</quarkus.version>
     <scala.version>3.8.4</scala.version>
     <zinc.version>2.0.1</zinc.version>
@@ -48,6 +49,13 @@
     </dependencies>
   </dependencyManagement>
   <build>
+    <plugins>
+      <plugin>
+        <groupId>net.revelc.code</groupId>
+        <artifactId>impsort-maven-plugin</artifactId>
+        <version>${impsort.version}</version>
+      </plugin>
+    </plugins>
     <pluginManagement>
       <plugins>
         <plugin>
